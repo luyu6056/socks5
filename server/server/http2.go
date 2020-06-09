@@ -1,6 +1,5 @@
 package server
 
-import "C"
 import (
 	"bytes"
 	"fmt"
