@@ -1,0 +1,6 @@
+{
+	"Listen": "tcp://:3306",
+	"Mysql_ssl_ca":"./config/EccCA.pem",
+	"Mysql_ssl_cert":"./config/EccSite.pem",
+	"Mysql_ssl_key":"./config/EccSite.key"
+}
