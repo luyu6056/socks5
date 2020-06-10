@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/x509"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -239,7 +238,7 @@ func (hs *f翻墙) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 }
 
 func (hs *f翻墙) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
-	fmt.Println(time.Now(), c.RemoteAddr().String(), err)
+	//fmt.Println(time.Now(), c.RemoteAddr().String(), err)
 	if ctx, ok := c.Context().(*Ctx); ok {
 		ctx.fd_m.Range(func(k, v interface{}) bool {
 			v.(*Conn).Close("客户端关闭链接")
