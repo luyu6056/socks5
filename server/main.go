@@ -10,12 +10,12 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"server/codec"
+	"server/config"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"tcpfan/config"
-	"tcpfan/server"
 	"time"
 
 	"github.com/luyu6056/gnet"
@@ -95,7 +95,7 @@ func main() {
 		log.Fatalf("certPool.AppendCertsFromPEM err")
 	}
 	go func() {
-		codec := &server.Tlscodec{}
+		codec := &codec.Tlscodec{}
 		h := &mainServer{addr: "tcp://:808", pool: gopool}
 		go gnet.Serve(h, h.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(64), gnet.WithMultiOut(false))
 		h443 := &mainServer{addr: "tcp://:443", pool: gopool}
@@ -487,7 +487,7 @@ func (code *CodecMysql) Decode(c gnet.Conn) ([]byte, error) {
 		//读取flag
 
 		flag := binary.LittleEndian.Uint32(data[4:8])
-		if flag&CLIENT_SSL != 0 || msglen < 36 {
+		if flag&CLIENT_SSL != 0 && msglen < 36 {
 			c.AsyncWrite(bad_handshake)
 			return nil, io.EOF
 		}
@@ -500,7 +500,7 @@ func (code *CodecMysql) Decode(c gnet.Conn) ([]byte, error) {
 			}
 			c.SetContext(ctx)
 			return nil, nil
-		} else {
+		} else if msglen > 36 {
 			mysqlbuf := buf_pool.Get().(*tls.MsgBuffer)
 			mysqlbuf.Reset()
 			mysqlbuf.Write(data[36:])
@@ -579,12 +579,12 @@ func (hs *mainServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 func (hs *mainServer) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 	switch svr := c.Context().(type) {
 
-	case *server.Httpserver:
+	case *codec.Httpserver:
 		svr.Request.Connection = ""
 
-		server.Httppool.Put(svr)
+		codec.Httppool.Put(svr)
 
-	case *server.Http2server:
+	case *codec.Http2server:
 		hs.pool.Submit(func() {
 			svr.Close()
 		})
@@ -598,7 +598,7 @@ var hello = []byte("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello word!")
 func (hs *mainServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 
 	switch svr := c.Context().(type) {
-	case *server.Httpserver:
+	case *codec.Httpserver:
 		switch svr.Request.Path {
 		case "/hello":
 			c.AsyncWrite(hello)
@@ -623,7 +623,7 @@ func (hs *mainServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 
 		return gnet.None
 
-	case *server.Http2server:
+	case *codec.Http2server:
 		svr.SendPool.Invoke(svr.WorkStream) //h2是异步，可能会Jitter抖动厉害
 		return
 	}

@@ -1,22 +1,3 @@
-2020/06/10 18:17:47 server started on tcp://:443 (loops: 4)
-2020/06/10 18:17:47 server started on tcp://:808 (loops: 4)
-2020/06/10 18:17:47 http server started on tcp://:3306 (loops: 8)
-panic: runtime error: slice bounds out of range [36:7]
-
-goroutine 43 [running]:
-main.(*CodecMysql).Decode(0xc00000f5e0, 0x99fa00, 0xc0000a88c0, 0xc000161c80, 0x200000003, 0xc000161c80, 0x0, 0xc000397e18)
-	/data/socks5/server/main.go:506 +0xae9
-github.com/luyu6056/gnet.(*conn).read(0xc0000a88c0, 0x7, 0x0, 0x0)
-	/root/go/pkg/mod/github.com/luyu6056/gnet@v1.2.2/connection_unix.go:132 +0x49
-github.com/luyu6056/gnet.(*eventloop).loopIn(0xc00007c6c0, 0xc0000a88c0, 0x0, 0x0)
-	/root/go/pkg/mod/github.com/luyu6056/gnet@v1.2.2/eventloop_unix.go:117 +0x125
-github.com/luyu6056/gnet.(*server).activateSubReactor.func2(0x2d, 0xc000000001, 0x80, 0x80)
-	/root/go/pkg/mod/github.com/luyu6056/gnet@v1.2.2/reactor_linux.go:31 +0xa8
-github.com/luyu6056/gnet/internal/netpoll.(*Poller).Polling(0xc0001107d0, 0xc000397f78, 0x0, 0x0)
-	/root/go/pkg/mod/github.com/luyu6056/gnet@v1.2.2/internal/netpoll/epoll.go:84 +0x136
-github.com/luyu6056/gnet.(*server).activateSubReactor(0xc00007a0b0, 0xc00007c6c0)
-	/root/go/pkg/mod/github.com/luyu6056/gnet@v1.2.2/reactor_linux.go:29 +0x9c
-github.com/luyu6056/gnet.(*server).startReactors.func1.1(0xc00007a0b0, 0xc00007c6c0)
-	/root/go/pkg/mod/github.com/luyu6056/gnet@v1.2.2/server_unix.go:94 +0x35
-created by github.com/luyu6056/gnet.(*server).startReactors.func1
-	/root/go/pkg/mod/github.com/luyu6056/gnet@v1.2.2/server_unix.go:93 +0x6a
+2020/06/15 12:48:50 http server started on tcp://:3306 (loops: 8)
+2020/06/15 12:48:50 server started on tcp://:443 (loops: 4)
+2020/06/15 12:48:50 server started on tcp://:808 (loops: 4)
