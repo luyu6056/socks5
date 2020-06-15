@@ -104,7 +104,7 @@ func main() {
 
 	}()
 	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
-	serverAddr = []*addr{{"127.0.0.1:3306", 0, 100 * 1024 * 1024, initWindowsSize}}
+	serverAddr = []*addr{{"149.129.99.31:3306", 0, 100 * 1024 * 1024, initWindowsSize}}
 
 	for i := 0; i < serverNum*len(serverAddr); i++ {
 		server := &ServerConn{fd_m: new(sync.Map), inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)]}

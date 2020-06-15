@@ -487,7 +487,7 @@ func (code *CodecMysql) Decode(c gnet.Conn) ([]byte, error) {
 		//读取flag
 
 		flag := binary.LittleEndian.Uint32(data[4:8])
-		if flag&CLIENT_SSL != 0 && msglen < 36 {
+		if flag&CLIENT_SSL != 0 || msglen < 36 {
 			c.AsyncWrite(bad_handshake)
 			return nil, io.EOF
 		}
