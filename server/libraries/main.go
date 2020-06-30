@@ -20,10 +20,10 @@ import (
 	"github.com/klauspost/compress/gzip"
 
 	"github.com/dlclark/regexp2"
-	"github.com/luyu6056/gnet/buf"
+	"github.com/luyu6056/tls"
 )
 
-var MsgBuf_chan = make(chan *buf.MsgBuffer, runtime.NumCPU())
+var MsgBuf_chan = make(chan *tls.MsgBuffer, runtime.NumCPU())
 
 func init() {
 	go func() {
@@ -36,10 +36,10 @@ func init() {
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 
-		MsgBuf_chan <- &buf.MsgBuffer{}
+		MsgBuf_chan <- &tls.MsgBuffer{}
 
 		gzip_writer := new(Gzip_writer)
-		gzip_writer.Buf = new(buf.MsgBuffer)
+		gzip_writer.Buf = new(tls.MsgBuffer)
 		gzip_writer.Writer, _ = gzip.NewWriterLevel(gzip_writer.Buf, 6)
 		gzipcompress_chan <- gzip_writer
 
@@ -51,7 +51,7 @@ type Buffer_reader struct {
 	b *bytes.Buffer
 }
 type Gzip_writer struct {
-	Buf    *buf.MsgBuffer
+	Buf    *tls.MsgBuffer
 	Writer *gzip.Writer
 }
 

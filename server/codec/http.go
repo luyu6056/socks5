@@ -17,7 +17,7 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 	"github.com/luyu6056/gnet"
-	"github.com/luyu6056/gnet/tls"
+	"github.com/luyu6056/tls"
 )
 
 type Httpserver struct {
