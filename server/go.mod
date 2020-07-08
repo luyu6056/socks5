@@ -1,4 +1,4 @@
-module server
+module tcpfan
 
 go 1.14
 
