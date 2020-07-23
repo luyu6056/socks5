@@ -9,8 +9,7 @@ import (
 	"net"
 	"runtime"
 
-	"net/http"
-	_ "net/http/pprof"
+	//_ "net/http/pprof"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -26,8 +25,8 @@ const (
 	headlen         = 3 //1cmd2fd
 	maxPlaintext    = 16384
 	outdelay        = time.Millisecond * 2
-	maxCiphertext   = 16384 + 2048
-	initWindowsSize = 16384 * 40
+	maxCiphertext   = maxPlaintext + 2048
+	initWindowsSize = maxPlaintext * 40
 )
 const (
 	cmd_none        = iota
@@ -49,9 +48,12 @@ const (
 	cmd_deleteIp //重启要求删除远程资源
 	cmd_reg
 )
+const (
+	statusOFF = 0
+	statusON  = 1
+)
 
 var (
-	netchan                []*ServerConn
 	socks5_auth            string = string([]byte{5, 1, 0})
 	socks5_authpwd         string = string([]byte{5, 1, 2})
 	socks5_auth_sussces    []byte = []byte{5, 0}
@@ -71,6 +73,9 @@ type ServerConn struct {
 	outbufchan, outChan           chan *tls.MsgBuffer
 	wait, c                       chan int
 	addr                          *addr
+	pingtime                      int64
+	pongtime                      int64
+	status                        int
 }
 type Conn struct {
 	windows_size int64
@@ -79,7 +84,6 @@ type Conn struct {
 	fd           [2]byte
 	c            gnet.Conn
 	wait         chan int
-	addr         *addr
 	send         uint64
 }
 type addr struct {
@@ -96,20 +100,26 @@ const (
 )
 
 func main() {
-	go func() {
+	/*go func() {
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
 			http.ListenAndServe("0.0.0.0:8082", nil)
 		}
 
-	}()
+	}()*/
 	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
-	serverAddr = []*addr{{"149.129.99.31:3306", 0, 100 * 1024 * 1024, initWindowsSize}}
-
+	serverAddr = []*addr{
+		{"202.81.235.45:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		{"202.81.235.51:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		{"202.81.235.114:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		{"202.81.231.131:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+	}
+	http := &httpServer{addr: "tcp://0.0.0.0:10808"}
 	for i := 0; i < serverNum*len(serverAddr); i++ {
 		server := &ServerConn{fd_m: new(sync.Map), inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)]}
 		server.buf = make([]byte, maxCiphertext)
-		netchan = append(netchan, server)
+		http.netchan = append(http.netchan, server)
+
 		handleOut(server)
 		go handleRemote(server)
 	}
@@ -120,7 +130,7 @@ func main() {
 		go ping(server)
 		go handleRemote(server)
 	}
-	http := &httpServer{addr: "tcp://0.0.0.0:10808"}
+
 	gnet.Serve(http, http.addr, gnet.WithLoopNum(8), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64))
 }
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
@@ -142,19 +152,26 @@ func (hs *httpServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 	conn := conn_pool.Get().(*Conn)
 	<-conn.wait
 	conn.auth = 0
-	r++
-	id := 0
-	srtt := float32(99999999)
-	for k, v := range serverAddr {
-		if v.srtt < srtt {
-			srtt = v.srtt
-			id = k
+
+	id := -1
+	for id == -1 {
+		r++
+		srtt := float32(99999999)
+		index := r % serverNum * len(serverAddr)
+		for i := 0; i < len(serverAddr); i++ {
+			if server := hs.netchan[index+i]; server.status == statusON && server.addr.srtt < srtt {
+				srtt = server.addr.srtt
+				id = index + i
+			}
+
 		}
+		if id == -1 {
+			time.Sleep(time.Second)
+		}
+
 	}
-	conn.server = netchan[r%serverNum*len(serverAddr)+id]
-	//fmt.Println(srtt, conn.server.addr)
+	conn.server = hs.netchan[id]
 	conn.c = c
-	conn.addr = serverAddr[id]
 	conn.windows_size = initWindowsSize
 	conn.wait <- connWaitok
 	c.SetContext(conn)
@@ -222,7 +239,7 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		//binary.LittleEndian.PutUint32(outbuf[5:], crc32.ChecksumIEEE(data)+conn.msgno)
 		//conn.msgno++
 
-		windows_update_size := conn.addr.windows_update_size
+		windows_update_size := conn.server.addr.windows_update_size
 		var new_size int64
 		if new_size = int64(windows_update_size) - conn.windows_size; new_size > 0 { //扩大窗口
 			atomic.AddInt64(&conn.windows_size, new_size)
@@ -245,6 +262,7 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 }
 
 type httpServer struct {
+	netchan []*ServerConn
 	*gnet.EventServer
 	addr string
 }
@@ -272,6 +290,7 @@ func Bytes2str(b []byte) string {
 func handleRemote(server *ServerConn) (err error) {
 	//先发送注册消息
 	defer func() {
+		server.status = statusOFF
 		if server.tlsconn != nil {
 			if server.tlsconn.HandshakeComplete() {
 				server.wait <- 0
@@ -292,10 +311,9 @@ func handleRemote(server *ServerConn) (err error) {
 	//
 
 	for {
-
 		n, err := server.conn.Read(server.buf)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("读错误1", err)
 			return err
 		}
 		server.tlsconn.RawWrite(server.buf[:n])
@@ -304,7 +322,7 @@ func handleRemote(server *ServerConn) (err error) {
 			server.inboundBuffer.Reset()
 		}
 		if err != nil && err != io.EOF {
-			fmt.Println(err)
+			fmt.Println("读错误2", err)
 			return err
 		}
 
@@ -360,7 +378,7 @@ func (server *ServerConn) do(msg []byte) {
 		}
 		conn.c.AsyncWrite(msg[headlen:])
 		windows_size := atomic.AddInt64(&conn.windows_size, int64(headlen-len(msg)))
-		windows_update_size := int64(conn.addr.windows_update_size)
+		windows_update_size := int64(conn.server.addr.windows_update_size)
 		if windows_size < windows_update_size/2 { //扩大窗口
 			if size := windows_update_size - conn.windows_size; size > 0 {
 				atomic.AddInt64(&conn.windows_size, size)
@@ -383,16 +401,13 @@ func (server *ServerConn) do(msg []byte) {
 
 	case cmd_pong:
 		pingtime := int64(msg[1]) | int64(msg[2])<<8 | int64(msg[3])<<16 | int64(msg[4])<<24 | int64(msg[5])<<32 | int64(msg[6])<<40 | int64(msg[7])<<48 | int64(msg[8])<<54
+		if pingtime != server.pingtime {
+			return
+		}
 		if server.addr.srtt == 0 {
 			server.addr.srtt = float32((time.Now().UnixNano() - pingtime) / 1e6)
 		} else {
-
-			server.addr.srtt = server.addr.srtt + 0.125*(float32(time.Now().UnixNano()-pingtime)/1e6-server.addr.srtt) //srtt = srtt + 0.125(rtt-srtt)
-			//计算一个新的窗口值，由于rtt不是实时获取，不能做那种实时的变动的rtt窗口
-			server.addr.windows_update_size = server.addr.bandwidth / 1000 * uint64(server.addr.srtt)
-			if server.addr.windows_update_size < 163840 {
-				server.addr.windows_update_size = 163840
-			}
+			server.getRtt(time.Now().UnixNano() - pingtime)
 
 		}
 
@@ -404,6 +419,15 @@ func (server *ServerConn) do(msg []byte) {
 
 	}
 }
+func (server *ServerConn) getRtt(timediff int64) {
+	server.addr.srtt = server.addr.srtt + 0.125*(float32(timediff)/1e6-server.addr.srtt) //srtt = srtt + 0.125(rtt-srtt)
+	//计算一个新的窗口值，由于rtt不是实时获取，不能做那种实时的变动的rtt窗口
+	server.addr.windows_update_size = server.addr.bandwidth / 1000 * uint64(server.addr.srtt)
+	if server.addr.windows_update_size < 163840 {
+		server.addr.windows_update_size = 163840
+	}
+}
+
 func (server *ServerConn) reg() error {
 
 	var err error
@@ -459,13 +483,13 @@ func (server *ServerConn) reg() error {
 		for data := server.tlsconn.RawData(); len(data) < 5 || int(data[3])<<8|int(data[4])+5 > len(data); data = server.tlsconn.RawData() {
 			n, err := server.conn.Read(server.buf)
 			if err != nil {
-				panic(err)
+				return err
 			}
 			server.tlsconn.RawWrite(server.buf[:n])
 		}
 
 		if err := server.tlsconn.Handshake(); err != nil {
-			panic(err)
+			return err
 		}
 	}
 
@@ -480,6 +504,7 @@ func (server *ServerConn) reg() error {
 		server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
 	}
+	server.status = statusON
 	server.c <- 0
 	fmt.Printf("connect to %s success\r\n", server.addr.addr)
 	return nil
@@ -530,9 +555,14 @@ func ping(server *ServerConn) {
 	b[0] = cmd_ping
 	for {
 		select {
-		case now := <-time.After(time.Second):
+		case <-time.After(time.Second):
 			server.wait <- 0
-			pingtime := uint64(now.UnixNano())
+			now := time.Now()
+			if server.pingtime > server.pongtime {
+				server.getRtt(now.UnixNano() - server.pingtime)
+			}
+			server.pingtime = now.UnixNano()
+			pingtime := uint64(server.pingtime)
 
 			b[1] = byte(pingtime & 255)
 			b[2] = byte(pingtime >> 8 & 255)
@@ -543,6 +573,7 @@ func ping(server *ServerConn) {
 			b[7] = byte(pingtime >> 48 & 255)
 			b[8] = byte(pingtime >> 54 & 255)
 			server.tlsconn.Write(b)
+
 			server.conn.Write(server.outboundBuffer.Bytes())
 			server.outboundBuffer.Reset()
 			<-server.wait
@@ -582,7 +613,7 @@ func init() {
 		ServerName:   "yy",
 		RootCAs:      certPool,
 		MaxVersion:   tls.VersionTLS13,
-		CipherSuites: []uint16{tls.TLS_AES_128_GCM_SHA256},
+		CipherSuites: []uint16{tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256},
 	}
 
 }

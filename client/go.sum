@@ -3,6 +3,8 @@ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSs
 github.com/klauspost/compress v1.10.3/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
 github.com/luyu6056/gnet v1.2.4 h1:8CB+vuPwYdyhbaxh/ZZmIKEfF/4F1C9MnGp6tnWN7SA=
 github.com/luyu6056/gnet v1.2.4/go.mod h1:grulBTzg37nhpvAv9IoLZ+2pq3Y4MZnvwFDoljbXINY=
+github.com/luyu6056/gnet v1.2.5 h1:+bRb7wajNyOuMC28OpszlpGkkHc4EwZ6N6tIbw1wYMg=
+github.com/luyu6056/gnet v1.2.5/go.mod h1:grulBTzg37nhpvAv9IoLZ+2pq3Y4MZnvwFDoljbXINY=
 github.com/luyu6056/tls v0.0.1 h1:HLlA4ZHU4xrV3RUu7oH6BLChyrvqLs5tBdylFVUD4Ks=
 github.com/luyu6056/tls v0.0.1/go.mod h1:yYfADrim0XVZMT+vvJAOkTrpGQ30M4BD+PuJrdKBRWk=
 github.com/panjf2000/ants/v2 v2.3.1/go.mod h1:LtwNaBX6OeF5qRtQlaeGndalVwJlS2ueur7uwoAHbPA=
