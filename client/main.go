@@ -9,7 +9,8 @@ import (
 	"net"
 	"runtime"
 
-	//_ "net/http/pprof"
+	"net/http"
+	_ "net/http/pprof"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -100,13 +101,13 @@ const (
 )
 
 func main() {
-	/*go func() {
+	go func() {
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
 			http.ListenAndServe("0.0.0.0:8082", nil)
 		}
 
-	}()*/
+	}()
 	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
 	serverAddr = []*addr{
 		{"202.81.235.45:3306", 0, 100 * 1024 * 1024, initWindowsSize},
@@ -290,11 +291,12 @@ func Bytes2str(b []byte) string {
 func handleRemote(server *ServerConn) (err error) {
 	//先发送注册消息
 	defer func() {
-		server.status = statusOFF
+		if server.status == statusON {
+			server.wait <- 0
+			server.status = statusOFF
+		}
+
 		if server.tlsconn != nil {
-			if server.tlsconn.HandshakeComplete() {
-				server.wait <- 0
-			}
 			server.tlsconn = nil
 		}
 
@@ -613,7 +615,7 @@ func init() {
 		ServerName:   "yy",
 		RootCAs:      certPool,
 		MaxVersion:   tls.VersionTLS13,
-		CipherSuites: []uint16{tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256},
+		CipherSuites: []uint16{tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, tls.TLS_AES_128_GCM_SHA256, tls.TLS_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
 	}
 
 }
