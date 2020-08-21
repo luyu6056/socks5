@@ -1,6 +1,6 @@
 module socks5tcp
 
-go 1.14
+go 1.15
 
 require (
 	github.com/luyu6056/gnet v1.2.5
@@ -8,3 +8,4 @@ require (
 )
 
 
+replace github.com/luyu6056/tls => ../../tls

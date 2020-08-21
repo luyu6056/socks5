@@ -10,13 +10,19 @@ github.com/klauspost/compress v1.10.3 h1:OP96hzwJVBIHYU52pVTI6CczrxPvrGfgqF9N5eT
 github.com/klauspost/compress v1.10.3/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
 github.com/klauspost/compress v1.10.10 h1:a/y8CglcM7gLGYmlbP/stPE5sR3hbhFRUjCBfd/0B3I=
 github.com/klauspost/compress v1.10.10/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
+github.com/klauspost/compress v1.10.11 h1:K9z59aO18Aywg2b/WSgBaUX99mHy2BES18Cr5lBKZHk=
+github.com/klauspost/compress v1.10.11/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
 github.com/luyu6056/gnet v1.1.1/go.mod h1:9NyY/YkNjczf+FyU07IvC3Izo6nRDQed5jfhk7qMt10=
 github.com/luyu6056/gnet v1.2.4 h1:8CB+vuPwYdyhbaxh/ZZmIKEfF/4F1C9MnGp6tnWN7SA=
 github.com/luyu6056/gnet v1.2.4/go.mod h1:grulBTzg37nhpvAv9IoLZ+2pq3Y4MZnvwFDoljbXINY=
+github.com/luyu6056/gnet v1.2.6 h1:7yRGK9Am7wEtl5yStdxcFaz1ax7X74sO6adxfMtYt7I=
+github.com/luyu6056/gnet v1.2.6/go.mod h1:w5wvsY88YUfmJ8HdEd4jzeojVa6SEnsE25D5OBcaIAU=
 github.com/luyu6056/gnet/tls v0.0.0-20200320144348-db512f05f945 h1:Kk2IGsw94UiUZDN5rG6ACI0uLxdvRKjm8eqnYSDFesw=
 github.com/luyu6056/gnet/tls v0.0.0-20200320144348-db512f05f945/go.mod h1:PjpoDRpP5/RvZt5S6Gad1ANMS08qn9ARtpLc8KQgALM=
 github.com/luyu6056/tls v0.0.1 h1:HLlA4ZHU4xrV3RUu7oH6BLChyrvqLs5tBdylFVUD4Ks=
 github.com/luyu6056/tls v0.0.1/go.mod h1:yYfADrim0XVZMT+vvJAOkTrpGQ30M4BD+PuJrdKBRWk=
+github.com/luyu6056/tls v0.15.0 h1:0xdRwAYH1qhJ9TMblkP9bv3bFkY/SyGrSazlqwu2PGo=
+github.com/luyu6056/tls v0.15.0/go.mod h1:JBwrTkFLJ3RtxCwmMXld0nKUhqVDl+xHTLXPQWHvi+s=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 h1:ZqeYNhU3OHLH3mGKHDcjJRFFRrJa6eAM5H+CtDdOsPc=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
 github.com/modern-go/reflect2 v0.0.0-20180701023420-4b7aa43c6742 h1:Esafd1046DLDQ0W1YjYsBW+p8U2u7vzgW2SQVmlNazg=
@@ -35,6 +41,7 @@ golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACk
 golang.org/x/crypto v0.0.0-20200311171314-f7b00557c8c4/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
 golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9 h1:psW17arqaxU48Z5kZ0CQnkZWQJsqcURM6tKiBApRjXI=
 golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
+golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3 h1:0GoQqolDA55aaLxZyTzK/Y2ePZzZTUrRacwib7cNsYQ=
 golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3/go.mod h1:t9HGtf8HONx5eT2rtn7q6eTqICYqUVnKs3thJo3Qplg=
 golang.org/x/net v0.0.0-20200324143707-d3edc9973b7e h1:3G+cUijn7XD+S4eJFddp53Pv7+slrESplyjG25HgL+k=
 golang.org/x/net v0.0.0-20200324143707-d3edc9973b7e/go.mod h1:qpuaurCH72eLCgpAm/N6yyVIVM9cpaDIP3A8BGJEC5A=

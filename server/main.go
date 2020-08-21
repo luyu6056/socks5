@@ -97,7 +97,7 @@ func main() {
 	go func() {
 		codec := &codec.Tlscodec{}
 		h := &mainServer{addr: "tcp://:808", pool: gopool}
-		go gnet.Serve(h, h.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(64), gnet.WithMultiOut(false))
+		go gnet.Serve(h, h.addr, gnet.WithLoopNum(4), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(32), gnet.WithMultiOut(false))
 		return
 		h443 := &mainServer{addr: "tcp://:443", pool: gopool}
 		gnet.Serve(h443, h443.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(64), gnet.WithMultiOut(false), gnet.WithTls(&tls.Config{
@@ -141,7 +141,7 @@ func main() {
 		},
 	}
 
-	log.Fatal(gnet.Serve(f, f.addr, gnet.WithLoopNum(8), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(64), gnet.WithMultiOut(false)))
+	log.Fatal(gnet.Serve(f, f.addr, gnet.WithLoopNum(8), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(128), gnet.WithMultiOut(false)))
 }
 
 type Conn struct {
@@ -157,7 +157,7 @@ type Conn struct {
 	wait         chan bool
 	waittime     time.Time
 	send         uint64
-	closechan chan *tls.MsgBuffer
+	closechan    chan *tls.MsgBuffer
 }
 
 type Ctx struct {
@@ -270,7 +270,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		conn.fd[1] = data[2]
 
 		conn.write = make(chan *tls.MsgBuffer, 64)
-		conn.closechan=make(chan *tls.MsgBuffer)
+		conn.closechan = make(chan *tls.MsgBuffer)
 		conn.conn = nil
 		conn.close = 0
 		conn.recno = 0
@@ -284,7 +284,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 			if err != nil {
 
 				conn.Close("fd拨号失败")
-				conn.closechan=make(chan *tls.MsgBuffer,1000000)
+				conn.closechan = make(chan *tls.MsgBuffer, 1000000)
 				return
 			} else {
 				if conn.close == 0 {
@@ -329,11 +329,10 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		b := buf_pool.Get().(*tls.MsgBuffer)
 		b.Reset()
 		b.Write(data[headlen+8:])
-		select{
-			case conn.write <- b:
-			case conn.closechan<-b:
+		select {
+		case conn.write <- b:
+		case conn.closechan <- b:
 		}
-		
 
 	case cmd_deletefd:
 		v, ok := ctx.fd_m.Load([2]byte{data[1], data[2]})

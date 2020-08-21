@@ -203,7 +203,8 @@ func (req *Request) Parsereq(data []byte) (n int, out []byte, err error) {
 	}
 	for s += 2; s < l; s += i + 2 {
 		i = bytes.Index(data[s:], []byte{13, 10})
-		if i > 15 {
+		switch {
+		case i > 15:
 			line := sdata[s : s+i]
 			switch {
 			case line[:15] == "Content-Length:", line[:15] == "Content-length:":
@@ -214,12 +215,14 @@ func (req *Request) Parsereq(data []byte) (n int, out []byte, err error) {
 				j := bytes.IndexByte(data[s:s+i], 58)
 				req.Header[line[:j]] = line[j+2:]
 			}
-		} else if i == 0 {
+		case i == 0:
 			s += i + 2
 			if l-s < clen {
 				break
 			}
 			return s + clen, data[s : s+clen], nil
+		case i == -1:
+			return 0, nil, nil
 		}
 
 	}
@@ -452,8 +455,8 @@ func (hs *Httpserver) httpsfinish(b io.Reader, l int) {
 	hs.Out.WriteString("\r\n\r\n")
 
 	for msglen := l; msglen > 0; msglen = l {
-		if msglen > http2initialMaxFrameSize-hs.Out.Len() { //切分为一个tls包
-			msglen = http2initialMaxFrameSize - hs.Out.Len()
+		if msglen > http2initialMaxFrameSize*100-hs.Out.Len() {
+			msglen = http2initialMaxFrameSize*100 - hs.Out.Len()
 		}
 		b.Read(hs.Out.Make(msglen))
 		hs.c.AsyncWrite(hs.Out.Bytes())

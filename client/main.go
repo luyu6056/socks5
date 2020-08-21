@@ -9,8 +9,8 @@ import (
 	"net"
 	"runtime"
 
-	"net/http"
-	_ "net/http/pprof"
+	//"net/http"
+	//_ "net/http/pprof"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -97,23 +97,23 @@ type addr struct {
 const (
 	connWaitok = iota
 	connWaitclose
-	serverNum = 8 //有效的连接数量
+	serverNum = 4 //有效的连接数量
 )
 
 func main() {
-	go func() {
+	/*go func() {
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
 			http.ListenAndServe("0.0.0.0:8082", nil)
 		}
 
-	}()
+	}()*/
 	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
 	serverAddr = []*addr{
-		{"202.81.235.45:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		{"202.81.235.51:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		//{"202.81.235.45:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		//{"202.81.235.51:3306", 0, 100 * 1024 * 1024, initWindowsSize},
 		{"202.81.235.114:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		{"202.81.231.131:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		//{"202.81.231.131:3306", 0, 100 * 1024 * 1024, initWindowsSize},
 	}
 	http := &httpServer{addr: "tcp://0.0.0.0:10808"}
 	for i := 0; i < serverNum*len(serverAddr); i++ {
@@ -132,7 +132,7 @@ func main() {
 		go handleRemote(server)
 	}
 
-	gnet.Serve(http, http.addr, gnet.WithLoopNum(8), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64))
+	gnet.Serve(http, http.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64))
 }
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	fmt.Println("listen", hs.addr, srv.NumEventLoop)
@@ -513,7 +513,7 @@ func (server *ServerConn) reg() error {
 }
 
 func handleOut(server *ServerConn) {
-	bufnum := runtime.NumCPU() * 4
+	bufnum := runtime.NumCPU()
 	server.outChan = make(chan *tls.MsgBuffer, bufnum)
 	server.outbufchan = make(chan *tls.MsgBuffer, bufnum)
 	for i := 0; i < bufnum; i++ {
@@ -611,11 +611,11 @@ func init() {
 		return
 	}
 	tlsconfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ServerName:   "yy",
-		RootCAs:      certPool,
-		MaxVersion:   tls.VersionTLS13,
-		CipherSuites: []uint16{tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, tls.TLS_AES_128_GCM_SHA256, tls.TLS_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: true,
+		RootCAs:            certPool,
+		MaxVersion:         tls.VersionTLS13,
+		CipherSuites:       []uint16{tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256}, //tls.TLS_AES_128_GCM_SHA256, tls.TLS_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
 	}
 
 }
