@@ -3,9 +3,8 @@ module socks5tcp
 go 1.15
 
 require (
-	github.com/luyu6056/gnet v1.2.5
-	github.com/luyu6056/tls v0.0.1
+	github.com/luyu6056/gnet v1.2.6
+	github.com/luyu6056/tls v0.15.0
 )
 
 
-replace github.com/luyu6056/tls => ../../tls

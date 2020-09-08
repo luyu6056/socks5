@@ -10,7 +10,8 @@ import (
 	"runtime"
 
 	//"net/http"
-	//_ "net/http/pprof"
+	"net/http"
+	_ "net/http/pprof"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -72,7 +73,7 @@ type ServerConn struct {
 	inboundBuffer, outboundBuffer *tls.MsgBuffer
 	buf                           []byte
 	outbufchan, outChan           chan *tls.MsgBuffer
-	wait, c                       chan int
+	wait                          chan int
 	addr                          *addr
 	pingtime                      int64
 	pongtime                      int64
@@ -101,19 +102,20 @@ const (
 )
 
 func main() {
-	/*go func() {
+	go func() {
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
 			http.ListenAndServe("0.0.0.0:8082", nil)
 		}
 
-	}()*/
+	}()
 	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
 	serverAddr = []*addr{
-		//{"202.81.235.45:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		//{"202.81.235.51:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		{"202.81.235.45:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		{"202.81.235.51:3306", 0, 100 * 1024 * 1024, initWindowsSize},
 		{"202.81.235.114:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		//{"202.81.231.131:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		{"202.81.231.131:3306", 0, 100 * 1024 * 1024, initWindowsSize},
+		//{"202.81.230.173:3306", 0, 200 * 1024 * 1024, initWindowsSize},
 	}
 	http := &httpServer{addr: "tcp://0.0.0.0:10808"}
 	for i := 0; i < serverNum*len(serverAddr); i++ {
@@ -507,7 +509,7 @@ func (server *ServerConn) reg() error {
 		server.outboundBuffer.Reset()
 	}
 	server.status = statusON
-	server.c <- 0
+	<-server.wait
 	fmt.Printf("connect to %s success\r\n", server.addr.addr)
 	return nil
 }
@@ -520,7 +522,6 @@ func handleOut(server *ServerConn) {
 		server.outbufchan <- &tls.MsgBuffer{}
 	}
 	server.wait = make(chan int, 1)
-	server.c = make(chan int)
 	server.wait <- 0
 	/*for i := len(server.outbufchan); i < cap(server.outbufchan); i++ {
 		server.outbufchan <- &tls.MsgBuffer{}
@@ -543,15 +544,13 @@ func handleOut(server *ServerConn) {
 				server.conn.Write(server.outboundBuffer.Bytes())
 				server.outboundBuffer.Reset()
 				<-server.wait
-			case <-server.wait:
-				<-server.c
 			}
 		}
 	}()
 }
 func ping(server *ServerConn) {
 	server.wait = make(chan int, 1)
-	server.c = make(chan int)
+
 	server.wait <- 0
 	b := make([]byte, 9)
 	b[0] = cmd_ping
@@ -579,8 +578,7 @@ func ping(server *ServerConn) {
 			server.conn.Write(server.outboundBuffer.Bytes())
 			server.outboundBuffer.Reset()
 			<-server.wait
-		case <-server.wait:
-			<-server.c
+
 		}
 	}
 
@@ -615,7 +613,7 @@ func init() {
 		InsecureSkipVerify: true,
 		RootCAs:            certPool,
 		MaxVersion:         tls.VersionTLS13,
-		CipherSuites:       []uint16{tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256}, //tls.TLS_AES_128_GCM_SHA256, tls.TLS_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
+		CipherSuites:       []uint16{tls.TLS_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, tls.TLS_AES_128_GCM_SHA256, tls.TLS_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
 	}
 
 }
