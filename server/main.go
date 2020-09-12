@@ -391,6 +391,9 @@ var antspool, _ = ants.NewPool(10240)
 func (conn *Conn) Close(reason string) {
 
 	if atomic.CompareAndSwapInt32(&conn.close, 0, 1) {
+		if conn.conn != nil {
+			conn.conn.Close()
+		}
 		conn.ctx.fd_m.Delete(conn.fd)
 		b := buf_pool.Get().(*tls.MsgBuffer)
 		b.Reset()
@@ -400,9 +403,7 @@ func (conn *Conn) Close(reason string) {
 		buf[2] = conn.fd[1]
 		conn.ctx.gnetconn.AsyncWrite(buf)
 		buf_pool.Put(b)
-		if conn.conn != nil {
-			conn.conn.Close()
-		}
+
 		select {
 		case conn.wait <- true:
 		default:
@@ -433,13 +434,19 @@ var handsocks, _ = ants.NewPoolWithFunc(65535, func(i interface{}) {
 	buf[0] = cmd_msg //数据包
 	buf[1] = conn.fd[0]
 	buf[2] = conn.fd[1]
+
 	for conn.close == 0 {
+		conn.conn.SetReadDeadline(time.Now().Add(time.Second * 30))
 		n, err := conn.conn.Read(buf[headlen:])
 		if err != nil {
 			if atomic.LoadInt32(&conn.close) == 0 {
-				conn.Close(conn.address + " 网站读取出错" + err.Error())
+				if e := err.Error(); !strings.Contains(e, ": i/o timeout") {
+					conn.Close(conn.address + " 网站读取出错" + err.Error())
+					return
+				}
+			} else {
+				return
 			}
-			return
 		}
 
 		msglen := headlen + n
