@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/x509"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -12,6 +13,7 @@ import (
 	_ "net/http/pprof"
 	"server/codec"
 	"server/config"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +34,6 @@ const (
 	CLIENT_SSL               = 0x00000800
 	CLIENT_PROTOCOL_41       = 0x00000200
 	CLIENT_SECURE_CONNECTION = 0x00008000 //1
-	initWindowsSize          = 16384 * 40 //引入http2流控概念
 )
 const (
 	cmd_none        = iota
@@ -64,6 +65,7 @@ type f翻墙 struct {
 	addr      string
 	pool      *ants.Pool
 	mysqladdr string
+	server    sync.Map
 }
 type mainServer struct {
 	*gnet.EventServer
@@ -73,7 +75,43 @@ type mainServer struct {
 
 var gopool, _ = ants.NewPool(1024, ants.WithPreAlloc(true))
 
+type fdsort []*Conn
+
+func (s fdsort) Len() int {
+	return len(s)
+}
+func (s fdsort) Less(i, j int) bool {
+	return uint16(s[i].fd[0])+uint16(s[i].fd[1])<<8 < uint16(s[j].fd[0])+uint16(s[j].fd[1])<<8
+}
+func (s fdsort) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
 func main() {
+	f := &f翻墙{addr: config.Server.Listen, pool: gopool}
+	http.HandleFunc("/fd", func(w http.ResponseWriter, r *http.Request) {
+		str := []string{}
+		f.server.Range(func(k, ctx interface{}) bool {
+			str = append(str, "server:"+k.(string))
+			var s fdsort
+			ctx.(*Ctx).fd_m.Range(func(k, v interface{}) bool {
+				s = append(s, v.(*Conn))
+				return true
+			})
+			sort.Sort(s)
+			for _, conn := range s {
+				if conn.close == 0 {
+					str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+strconv.Itoa(int(conn.windows_size)))
+				} else {
+					str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+conn.close_reason)
+				}
+
+			}
+
+			return true
+		})
+
+		w.Write([]byte(strings.Join(str, "\r\n")))
+	})
 	go func() {
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
@@ -118,10 +156,11 @@ func main() {
 			MinVersion: tls.VersionTLS12,
 		}))
 	}()
-	f := &f翻墙{addr: config.Server.Listen, pool: gopool}
+
 	defer f.pool.Release()
 
 	codec := &CodecMysql{
+		server: f,
 		tlsconfig: &tls.Config{
 			Certificates:             []tls.Certificate{cert},
 			ClientAuth:               tls.RequireAndVerifyClientCert,
@@ -145,6 +184,7 @@ func main() {
 }
 
 type Conn struct {
+	windows_size int64
 	ctx          *Ctx
 	conn         net.Conn
 	close        int32
@@ -153,16 +193,15 @@ type Conn struct {
 	write        chan *tls.MsgBuffer
 	recno        uint32
 	msgno        uint32
-	windows_size int64
 	wait         chan bool
-	waittime     time.Time
 	send         uint64
-	closechan    chan *tls.MsgBuffer
+	close_reason string
 }
 
 type Ctx struct {
 	gnetconn gnet.Conn
 	fd_m     *sync.Map
+	server   *f翻墙
 }
 
 func (hs *f翻墙) OnInitComplete(srv gnet.Server) (action gnet.Action) {
@@ -179,6 +218,8 @@ func (hs *f翻墙) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 	time.AfterFunc(time.Second*10, func() {
 		if c.Context() == nil && c != nil {
 			c.Close()
+		} else {
+			hs.server.Store(c.RemoteAddr().String(), c.Context())
 		}
 	})
 	mysqlbuf := buf_pool.Get().(*tls.MsgBuffer)
@@ -248,6 +289,7 @@ func (hs *f翻墙) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 		})
 
 		c.SetContext(nil)
+		hs.server.Delete(c.RemoteAddr().String())
 	}
 	return
 }
@@ -270,21 +312,36 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		conn.fd[1] = data[2]
 
 		conn.write = make(chan *tls.MsgBuffer, 64)
-		conn.closechan = make(chan *tls.MsgBuffer)
+
 		conn.conn = nil
 		conn.close = 0
 		conn.recno = 0
 		conn.msgno = 0
-		conn.windows_size = initWindowsSize
+		conn.windows_size = 0
 		conn.wait = make(chan bool)
 
 		ctx.fd_m.Store(conn.fd, conn)
 		antspool.Submit(func() {
+
+			/*lAddr, err := net.ResolveTCPAddr("tcp", "202.81.235.114:0")
+			if err != nil {
+				conn.Close("fd拨号失败")
+				conn.write = make(chan *tls.MsgBuffer, 1000000)
+				return
+			}
+
+			//被请求的地址 fmt.Println(addr)
+			rAddr, err := net.ResolveTCPAddr("tcp", addr)
+			if err != nil {
+				conn.Close("fd拨号失败")
+				conn.write = make(chan *tls.MsgBuffer, 1000000)
+				return
+			}
+			netconn, err := net.DialTCP("tcp", lAddr, rAddr)*/
 			netconn, err := net.Dial("tcp", addr)
 			if err != nil {
-
 				conn.Close("fd拨号失败")
-				conn.closechan = make(chan *tls.MsgBuffer, 1000000)
+				conn.write = make(chan *tls.MsgBuffer, 1000000)
 				return
 			} else {
 				if conn.close == 0 {
@@ -292,7 +349,10 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 					handsocks.Invoke(conn)
 
 					for b := range conn.write {
-
+						if b == nil {
+							conn.write = make(chan *tls.MsgBuffer, 1000000)
+							return
+						}
 						conn.conn.Write(b.Bytes())
 						buf_pool.Put(b)
 					}
@@ -315,13 +375,15 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		}
 		conn := v.(*Conn)
 		windows_update_size := int64(data[3]) | int64(data[4])<<8 | int64(data[5])<<16 | int64(data[6])<<24 | int64(data[7])<<32 | int64(data[8])<<40 | int64(data[9])<<48 | int64(data[10])<<54
-		if windows_update_size > 0 {
+
+		if windows_update_size != 0 {
+
 			old := atomic.AddInt64(&conn.windows_size, windows_update_size) - windows_update_size
 			if old < 0 {
 				antspool.Submit(func() {
 					select {
 					case conn.wait <- true:
-					case <-time.After(time.Second * 2):
+					case <-time.After(time.Second):
 					}
 				})
 			}
@@ -329,10 +391,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		b := buf_pool.Get().(*tls.MsgBuffer)
 		b.Reset()
 		b.Write(data[headlen+8:])
-		select {
-		case conn.write <- b:
-		case conn.closechan <- b:
-		}
+		conn.write <- b
 
 	case cmd_deletefd:
 		v, ok := ctx.fd_m.Load([2]byte{data[1], data[2]})
@@ -351,7 +410,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 				antspool.Submit(func() {
 					select {
 					case conn.wait <- true:
-					case <-time.After(time.Second * 2):
+					case <-time.After(time.Second):
 					}
 				})
 			}
@@ -391,24 +450,27 @@ var antspool, _ = ants.NewPool(10240)
 func (conn *Conn) Close(reason string) {
 
 	if atomic.CompareAndSwapInt32(&conn.close, 0, 1) {
-		if conn.conn != nil {
-			conn.conn.Close()
-		}
-		conn.ctx.fd_m.Delete(conn.fd)
-		b := buf_pool.Get().(*tls.MsgBuffer)
-		b.Reset()
-		buf := b.Make(3)
-		buf[0] = cmd_deletefd
-		buf[1] = conn.fd[0]
-		buf[2] = conn.fd[1]
-		conn.ctx.gnetconn.AsyncWrite(buf)
-		buf_pool.Put(b)
+		conn.ctx.server.pool.Submit(func() {
+			if conn.conn != nil {
+				conn.conn.Close()
+			}
+			conn.ctx.fd_m.Delete(conn.fd)
+			conn.close_reason = reason
+			b := buf_pool.Get().(*tls.MsgBuffer)
+			b.Reset()
+			buf := b.Make(3)
+			buf[0] = cmd_deletefd
+			buf[1] = conn.fd[0]
+			buf[2] = conn.fd[1]
+			conn.ctx.gnetconn.AsyncWrite(buf)
+			buf_pool.Put(b)
 
-		select {
-		case conn.wait <- true:
-		default:
-		}
-
+			select {
+			case conn.wait <- false:
+			case <-time.After(time.Second * 10):
+			}
+			conn.write <- nil
+		})
 	}
 
 }
@@ -424,10 +486,15 @@ var handsocks, _ = ants.NewPoolWithFunc(65535, func(i interface{}) {
 	if !ok {
 		return
 	}
-
+	var err error
+	var n int
 	defer func() {
+		if err != nil {
+			conn.Close(conn.address + " 网站读取出错" + err.Error())
+		} else {
+			conn.Close(conn.address + " read异常关闭")
+		}
 
-		close(conn.write)
 	}()
 
 	buf := make([]byte, maxPlaintext)
@@ -436,14 +503,14 @@ var handsocks, _ = ants.NewPoolWithFunc(65535, func(i interface{}) {
 	buf[2] = conn.fd[1]
 
 	for conn.close == 0 {
-		conn.conn.SetReadDeadline(time.Now().Add(time.Second * 30))
-		n, err := conn.conn.Read(buf[headlen:])
-		if err != nil {
+		n, err = conn.conn.Read(buf[headlen:])
+		if err != nil || n < 1 {
 			if atomic.LoadInt32(&conn.close) == 0 {
 				if e := err.Error(); !strings.Contains(e, ": i/o timeout") {
-					conn.Close(conn.address + " 网站读取出错" + err.Error())
+
 					return
 				}
+				continue
 			} else {
 				return
 			}
@@ -452,11 +519,16 @@ var handsocks, _ = ants.NewPoolWithFunc(65535, func(i interface{}) {
 		msglen := headlen + n
 
 		conn.ctx.gnetconn.AsyncWrite(buf[:msglen])
-		size := atomic.AddInt64(&conn.windows_size, -1*int64(n))
-		if size <= 0 {
-			conn.waittime = time.Now()
+		atomic.AddInt64(&conn.windows_size, -1*int64(n))
+
+		for atomic.LoadInt64(&conn.windows_size) <= 0 && conn.close == 0 {
+
 			select {
-			case <-conn.wait:
+			case flag := <-conn.wait:
+				if !flag {
+					return
+				}
+			case <-time.After(time.Second):
 			}
 		}
 	}
@@ -466,6 +538,7 @@ var handsocks, _ = ants.NewPoolWithFunc(65535, func(i interface{}) {
 type CodecMysql struct {
 	mysqladdr string
 	tlsconfig *tls.Config
+	server    *f翻墙
 }
 
 func (code *CodecMysql) Encode(c gnet.Conn, buf []byte) ([]byte, error) {
@@ -511,6 +584,7 @@ func (code *CodecMysql) Decode(c gnet.Conn) ([]byte, error) {
 			ctx := &Ctx{
 				fd_m:     new(sync.Map),
 				gnetconn: c,
+				server:   code.server,
 			}
 			c.SetContext(ctx)
 			return nil, nil

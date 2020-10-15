@@ -213,6 +213,9 @@ func (req *Request) Parsereq(data []byte) (n int, out []byte, err error) {
 				req.Connection = "close"
 			default:
 				j := bytes.IndexByte(data[s:s+i], 58)
+				if j == -1 {
+					return 0, nil, nil
+				}
 				req.Header[line[:j]] = line[j+2:]
 			}
 		case i == 0:
