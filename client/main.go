@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"runtime"
+	"sort"
+	"strings"
 
 	//"net/http"
 	"net/http"
@@ -72,21 +73,26 @@ type ServerConn struct {
 
 	inboundBuffer, outboundBuffer *tls.MsgBuffer
 	buf                           []byte
-	outbufchan, outChan           chan *tls.MsgBuffer
+	outbufchan, outChan           chan *serverOutBuf
 	wait                          chan int
 	addr                          *addr
 	pingtime                      int64
 	pongtime                      int64
 	status                        int
 }
+type serverOutBuf struct {
+	buf *tls.MsgBuffer
+	c   *Conn
+}
 type Conn struct {
 	windows_size int64
+	remote       int32
 	auth         int
 	server       *ServerConn
 	fd           [2]byte
 	c            gnet.Conn
 	wait         chan int
-	send         uint64
+	close        string
 }
 type addr struct {
 	addr                string
@@ -98,11 +104,59 @@ type addr struct {
 const (
 	connWaitok = iota
 	connWaitclose
-	serverNum = 4 //有效的连接数量
+	serverNum       = 4 //有效的连接数量
+	connAuthClose   = 0
+	connAuthNone    = 1
+	connAuthPw      = 2
+	connAuthOk      = 3
+	connAuthMessage = 4
+	connRemoteClose = 0
+	connRemoteOpen  = 1
 )
 
+type httpServer struct {
+	netchan []*ServerConn
+	*gnet.EventServer
+	addr string
+}
+type fdsort []*Conn
+
+func (s fdsort) Len() int {
+	return len(s)
+}
+func (s fdsort) Less(i, j int) bool {
+	return uint16(s[i].fd[0])+uint16(s[i].fd[1])<<8 < uint16(s[j].fd[0])+uint16(s[j].fd[1])<<8
+}
+func (s fdsort) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
 func main() {
+	hs := &httpServer{addr: "tcp://0.0.0.0:10808"}
 	go func() {
+		http.HandleFunc("/fd", func(w http.ResponseWriter, r *http.Request) {
+			str := []string{}
+			for k, server := range hs.netchan {
+				str = append(str, "server_id:"+strconv.Itoa(k))
+				var s fdsort
+				server.fd_m.Range(func(k, v interface{}) bool {
+
+					s = append(s, v.(*Conn))
+					return true
+				})
+				sort.Sort(s)
+				for _, conn := range s {
+					if conn.close != "" {
+						str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+conn.close)
+					} else {
+						str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+strconv.Itoa(int(conn.windows_size)))
+					}
+
+				}
+
+			}
+
+			w.Write([]byte(strings.Join(str, "\r\n")))
+		})
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
 			http.ListenAndServe("0.0.0.0:8082", nil)
@@ -111,51 +165,33 @@ func main() {
 	}()
 	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
 	serverAddr = []*addr{
-		{"202.81.235.45:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		{"202.81.235.51:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		{"202.81.235.114:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		{"202.81.231.131:3306", 0, 100 * 1024 * 1024, initWindowsSize},
-		//{"202.81.230.173:3306", 0, 200 * 1024 * 1024, initWindowsSize},
+
+		//{"202.81.230.173:3303", 0, 160 * 1024 * 1024, initWindowsSize},
 	}
-	http := &httpServer{addr: "tcp://0.0.0.0:10808"}
+
 	for i := 0; i < serverNum*len(serverAddr); i++ {
 		server := &ServerConn{fd_m: new(sync.Map), inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)]}
 		server.buf = make([]byte, maxCiphertext)
-		http.netchan = append(http.netchan, server)
+		hs.netchan = append(hs.netchan, server)
 
 		handleOut(server)
 		go handleRemote(server)
 	}
-	for i := 0; i < len(serverAddr); i++ {
-		server := &ServerConn{fd_m: new(sync.Map), inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)]}
-		server.buf = make([]byte, maxCiphertext)
 
-		go ping(server)
-		go handleRemote(server)
-	}
-
-	gnet.Serve(http, http.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64))
+	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64))
 }
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	fmt.Println("listen", hs.addr, srv.NumEventLoop)
 	return
 }
 
-var conn_pool = &sync.Pool{
-	New: func() interface{} {
-		b := &Conn{}
-		b.wait = make(chan int, 1)
-		b.wait <- connWaitclose
-		return b
-	},
-}
 var r = 1
 
 func (hs *httpServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
-	conn := conn_pool.Get().(*Conn)
-	<-conn.wait
-	conn.auth = 0
-
+	conn := &Conn{}
+	conn.wait = make(chan int, 1)
+	conn.auth = connAuthNone
+	conn.remote = connRemoteClose
 	id := -1
 	for id == -1 {
 		r++
@@ -173,24 +209,33 @@ func (hs *httpServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 		}
 
 	}
-	conn.server = hs.netchan[id]
+	//r++
+
+	conn.server = hs.netchan[id%serverNum]
 	conn.c = c
-	conn.windows_size = initWindowsSize
+	conn.windows_size = 0
 	conn.wait <- connWaitok
 	c.SetContext(conn)
+
 	return
 }
 
 func (hs *httpServer) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 	if conn, ok := c.Context().(*Conn); ok {
 		<-conn.wait
+		conn.wait <- connWaitclose
+		conn.auth = connAuthClose
 		conn.server.fd_m.Delete(conn.fd)
 		c.SetContext(nil)
-		if conn.auth == 3 {
+		if conn.close == "" {
+			conn.close = "未知关闭"
+		}
+
+		if conn.remote == connRemoteOpen {
+			conn.remote = connRemoteClose
 			conn.Remoteclose()
 		}
-		conn.wait <- connWaitclose
-		time.AfterFunc(time.Second, func() { conn_pool.Put(conn) })
+
 	}
 	return
 }
@@ -200,21 +245,21 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 	conn := c.Context().(*Conn)
 
 	switch conn.auth {
-	case 0:
+	case connAuthNone:
 		if len(data) > 2 {
 			if Bytes2str(data[:3]) == socks5_auth {
 				c.AsyncWrite(socks5_auth_sussces)
-				conn.auth = 2
+				conn.auth = connAuthOk
 			}
 			if Bytes2str(data[:3]) == socks5_authpwd {
 				c.AsyncWrite(socks5_authpwd_sussces)
-				conn.auth = 1
+				conn.auth = connAuthPw
 			}
 		}
-	case 1:
+	case connAuthPw:
 		c.AsyncWrite([]byte{1, 0})
-		conn.auth = 2
-	case 2:
+		conn.auth = connAuthOk
+	case connAuthOk:
 
 		switch data[3] {
 		case 1: //ipv4
@@ -224,18 +269,18 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 			}
 
 			conn.getfd(append(bytes.Join(str, []byte{46}), data[len(data)-2:]...))
-			conn.auth = 3
+			conn.auth = connAuthMessage
 			c.AsyncWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 		case 3: //域名
 			conn.getfd(data[5:])
-			conn.auth = 3
+			conn.auth = connAuthMessage
 			c.AsyncWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 		case 4: //ipv6
 		}
-	case 3:
-
+	case connAuthMessage:
 		b := <-conn.server.outbufchan
-		buf := b.Make(headlen + len(data) + 8)
+		b.c = conn
+		buf := b.buf.Make(headlen + len(data) + 8)
 		buf[0] = cmd_msg //数据包
 		buf[1] = conn.fd[0]
 		buf[2] = conn.fd[1]
@@ -246,6 +291,7 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		var new_size int64
 		if new_size = int64(windows_update_size) - conn.windows_size; new_size > 0 { //扩大窗口
 			atomic.AddInt64(&conn.windows_size, new_size)
+
 		} else {
 			new_size = 0
 		}
@@ -264,25 +310,23 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 	return
 }
 
-type httpServer struct {
-	netchan []*ServerConn
-	*gnet.EventServer
-	addr string
-}
-
 func (conn *Conn) getfd(data []byte) {
 
 	b := <-conn.server.outbufchan
-	buf := b.Make(headlen + len(data))
-
+	buf := b.buf.Make(headlen + len(data))
+	b.c = conn
 	buf[0] = cmd_getfd //注册fd值
 	fd := uint16(atomic.AddUint32(&conn.server.fd, 1))
+	for _, ok := conn.server.fd_m.Load(fd); ok; _, ok = conn.server.fd_m.Load(fd) {
+		fd = uint16(atomic.AddUint32(&conn.server.fd, 1))
+	}
 	conn.fd[0] = byte(fd)
 	conn.fd[1] = byte(fd >> 8)
 	conn.server.fd_m.Store(conn.fd, conn)
 	buf[1] = conn.fd[0]
 	buf[2] = conn.fd[1]
 	copy(buf[headlen:], data)
+	conn.remote = connRemoteOpen
 	conn.server.outChan <- b
 }
 
@@ -366,17 +410,14 @@ func (server *ServerConn) do(msg []byte) {
 		} else {
 			return
 		}
+		conn.close = "服务器要求远程关闭"
+		conn.remote = connRemoteClose
 		conn.c.Close()
 		return
 	case cmd_msg:
 
 		if v, ok := server.fd_m.Load([2]byte{msg[1], msg[2]}); ok {
 			conn = v.(*Conn)
-			flag := <-conn.wait
-			defer func() { conn.wait <- flag }()
-			if flag == connWaitclose {
-				return
-			}
 		} else {
 			return
 		}
@@ -387,7 +428,8 @@ func (server *ServerConn) do(msg []byte) {
 			if size := windows_update_size - conn.windows_size; size > 0 {
 				atomic.AddInt64(&conn.windows_size, size)
 				b := <-server.outbufchan
-				buf := b.Make(11)
+				buf := b.buf.Make(11)
+				b.c = nil
 				buf[0] = cmd_windowsupdate
 				buf[1] = conn.fd[0]
 				buf[2] = conn.fd[1]
@@ -515,80 +557,94 @@ func (server *ServerConn) reg() error {
 }
 
 func handleOut(server *ServerConn) {
-	bufnum := runtime.NumCPU()
-	server.outChan = make(chan *tls.MsgBuffer, bufnum)
-	server.outbufchan = make(chan *tls.MsgBuffer, bufnum)
+	bufnum := 128
+	server.outChan = make(chan *serverOutBuf, bufnum)
+	server.outbufchan = make(chan *serverOutBuf, bufnum)
 	for i := 0; i < bufnum; i++ {
-		server.outbufchan <- &tls.MsgBuffer{}
+		server.outbufchan <- &serverOutBuf{buf: &tls.MsgBuffer{}}
 	}
 	server.wait = make(chan int, 1)
 	server.wait <- 0
-	/*for i := len(server.outbufchan); i < cap(server.outbufchan); i++ {
-		server.outbufchan <- &tls.MsgBuffer{}
-	}*/
+	tick := time.NewTicker(time.Second * 5)
+
+	pingdata := make([]byte, 9)
+	pingdata[0] = cmd_ping
+	pingfunc := func() {
+		server.wait <- 0
+		now := time.Now()
+		if server.pingtime > server.pongtime {
+			server.getRtt(now.UnixNano() - server.pingtime)
+		}
+		server.pingtime = now.UnixNano()
+		pingtime := uint64(server.pingtime)
+		pingdata[1] = byte(pingtime & 255)
+		pingdata[2] = byte(pingtime >> 8 & 255)
+		pingdata[3] = byte(pingtime >> 16 & 255)
+		pingdata[4] = byte(pingtime >> 24 & 255)
+		pingdata[5] = byte(pingtime >> 32 & 255)
+		pingdata[6] = byte(pingtime >> 40 & 255)
+		pingdata[7] = byte(pingtime >> 48 & 255)
+		pingdata[8] = byte(pingtime >> 54 & 255)
+		server.tlsconn.Write(pingdata)
+
+		server.conn.Write(server.outboundBuffer.Bytes())
+		server.outboundBuffer.Reset()
+		<-server.wait
+	}
 
 	go func() {
+		pingfunc()
 		for {
 			select {
 			case b := <-server.outChan:
 				server.wait <- 0
-				server.tlsconn.Write(b.Bytes())
-				b.Reset()
+				if b.c != nil {
+					flag := <-b.c.wait
+					if flag == connWaitok {
+						server.tlsconn.Write(b.buf.Bytes())
+					}
+					b.c.wait <- flag
+					b.c = nil
+				} else {
+					server.tlsconn.Write(b.buf.Bytes())
+				}
+
+				b.buf.Reset()
 				server.outbufchan <- b
 				for i := 0; i < len(server.outChan); i++ {
 					b := <-server.outChan
-					server.tlsconn.Write(b.Bytes())
-					b.Reset()
+					if b.c != nil {
+						flag := <-b.c.wait
+						if flag == connWaitok {
+							server.tlsconn.Write(b.buf.Bytes())
+						}
+						b.c.wait <- flag
+						b.c = nil
+					} else {
+						server.tlsconn.Write(b.buf.Bytes())
+					}
+					b.buf.Reset()
 					server.outbufchan <- b
 				}
 				server.conn.Write(server.outboundBuffer.Bytes())
 				server.outboundBuffer.Reset()
 				<-server.wait
+			case <-tick.C:
+				pingfunc()
 			}
+
 		}
 	}()
 }
-func ping(server *ServerConn) {
-	server.wait = make(chan int, 1)
 
-	server.wait <- 0
-	b := make([]byte, 9)
-	b[0] = cmd_ping
-	for {
-		select {
-		case <-time.After(time.Second):
-			server.wait <- 0
-			now := time.Now()
-			if server.pingtime > server.pongtime {
-				server.getRtt(now.UnixNano() - server.pingtime)
-			}
-			server.pingtime = now.UnixNano()
-			pingtime := uint64(server.pingtime)
-
-			b[1] = byte(pingtime & 255)
-			b[2] = byte(pingtime >> 8 & 255)
-			b[3] = byte(pingtime >> 16 & 255)
-			b[4] = byte(pingtime >> 24 & 255)
-			b[5] = byte(pingtime >> 32 & 255)
-			b[6] = byte(pingtime >> 40 & 255)
-			b[7] = byte(pingtime >> 48 & 255)
-			b[8] = byte(pingtime >> 54 & 255)
-			server.tlsconn.Write(b)
-
-			server.conn.Write(server.outboundBuffer.Bytes())
-			server.outboundBuffer.Reset()
-			<-server.wait
-
-		}
-	}
-
-}
 func (conn *Conn) Remoteclose() {
 	if conn.server.tlsconn == nil || !conn.server.tlsconn.HandshakeComplete() {
 		return
 	}
+	conn.close = "本地要求远程关闭"
 	b := <-conn.server.outbufchan
-	buf := b.Make(3)
+	buf := b.buf.Make(3)
+	b.c = nil
 	buf[0] = cmd_deletefd
 	buf[1] = conn.fd[0]
 	buf[2] = conn.fd[1]
