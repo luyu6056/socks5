@@ -57,7 +57,8 @@ const (
 )
 
 var (
-	padding = make([]byte, 15)
+	padding  = make([]byte, 15)
+	client_m sync.Map
 )
 
 type f翻墙 struct {
@@ -71,6 +72,10 @@ type mainServer struct {
 	*gnet.EventServer
 	addr string
 	pool *ants.Pool
+}
+type client struct {
+	fd_m sync.Map
+	key  string
 }
 
 var gopool, _ = ants.NewPool(1024, ants.WithPreAlloc(true))
@@ -90,10 +95,10 @@ func main() {
 	f := &f翻墙{addr: config.Server.Listen, pool: gopool}
 	http.HandleFunc("/fd", func(w http.ResponseWriter, r *http.Request) {
 		str := []string{}
-		f.server.Range(func(k, ctx interface{}) bool {
+		client_m.Range(func(k, c interface{}) bool {
 			str = append(str, "server:"+k.(string))
 			var s fdsort
-			ctx.(*Ctx).fd_m.Range(func(k, v interface{}) bool {
+			c.(*client).fd_m.Range(func(k, v interface{}) bool {
 				s = append(s, v.(*Conn))
 				return true
 			})
@@ -200,7 +205,7 @@ type Conn struct {
 
 type Ctx struct {
 	gnetconn gnet.Conn
-	fd_m     *sync.Map
+	client   *client
 	server   *f翻墙
 }
 
@@ -283,10 +288,12 @@ func (hs *f翻墙) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 func (hs *f翻墙) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 	//fmt.Println(time.Now(), c.RemoteAddr().String(), err)
 	if ctx, ok := c.Context().(*Ctx); ok {
-		ctx.fd_m.Range(func(k, v interface{}) bool {
-			v.(*Conn).Close("客户端关闭链接")
-			return true
-		})
+		if ctx.client != nil {
+			ctx.client.fd_m.Range(func(k, v interface{}) bool {
+				v.(*Conn).Close("客户端关闭链接")
+				return true
+			})
+		}
 
 		c.SetContext(nil)
 		hs.server.Delete(c.RemoteAddr().String())
@@ -301,7 +308,9 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 	}
 	switch data[0] {
 	case cmd_getfd:
-
+		if ctx.client == nil {
+			return
+		}
 		port := binary.BigEndian.Uint16(data[len(data)-2:])
 		addr := string(data[headlen:len(data)-2]) + ":" + strconv.Itoa(int(port))
 
@@ -320,7 +329,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		conn.windows_size = 0
 		conn.wait = make(chan bool)
 
-		ctx.fd_m.Store(conn.fd, conn)
+		ctx.client.fd_m.Store(conn.fd, conn)
 		antspool.Submit(func() {
 
 			/*lAddr, err := net.ResolveTCPAddr("tcp", "202.81.235.114:0")
@@ -363,8 +372,10 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 
 		})
 	case cmd_msg:
-
-		v, ok := ctx.fd_m.Load([2]byte{data[1], data[2]})
+		if ctx.client == nil {
+			return
+		}
+		v, ok := ctx.client.fd_m.Load([2]byte{data[1], data[2]})
 		if !ok {
 			b := make([]byte, 3)
 			b[0] = cmd_deletefd
@@ -394,13 +405,19 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		conn.write <- b
 
 	case cmd_deletefd:
-		v, ok := ctx.fd_m.Load([2]byte{data[1], data[2]})
+		if ctx.client == nil {
+			return
+		}
+		v, ok := ctx.client.fd_m.Load([2]byte{data[1], data[2]})
 		if ok {
 			v.(*Conn).Close("客户端要求关闭")
 
 		}
 	case cmd_windowsupdate:
-		v, ok := ctx.fd_m.Load([2]byte{data[1], data[2]})
+		if ctx.client == nil {
+			return
+		}
+		v, ok := ctx.client.fd_m.Load([2]byte{data[1], data[2]})
 		if ok {
 			conn := v.(*Conn)
 			windows_update_size := int64(data[3]) | int64(data[4])<<8 | int64(data[5])<<16 | int64(data[6])<<24 | int64(data[7])<<32 | int64(data[8])<<40 | int64(data[9])<<48 | int64(data[10])<<54
@@ -416,7 +433,20 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 			}
 		}
 	case cmd_reg:
-		c.AsyncWrite(make([]byte, 65535*2)) //消灭分包
+
+		key := string(data[1:])
+		C := &client{key: key}
+		if v, ok := client_m.LoadOrStore(key, C); ok {
+			ctx.client = v.(*client)
+			c.AsyncWrite(make([]byte, 65535*2)) //消灭分包
+		} else {
+			v, _ = client_m.Load(key)
+			ctx.client = v.(*client)
+			data[0] = cmd_deleteIp
+			c.AsyncWrite(data)                  //清空客户端的fd
+			c.AsyncWrite(make([]byte, 65535*2)) //消灭分包
+		}
+
 	case cmd_ping:
 		data[0] = cmd_pong
 		c.AsyncWrite(data)
@@ -454,7 +484,8 @@ func (conn *Conn) Close(reason string) {
 			if conn.conn != nil {
 				conn.conn.Close()
 			}
-			conn.ctx.fd_m.Delete(conn.fd)
+			//fmt.Println(conn.fd, reason)
+			conn.ctx.client.fd_m.Delete(conn.fd)
 			conn.close_reason = reason
 			b := buf_pool.Get().(*tls.MsgBuffer)
 			b.Reset()
@@ -582,7 +613,7 @@ func (code *CodecMysql) Decode(c gnet.Conn) ([]byte, error) {
 			//设置tls
 			c.UpgradeTls(code.tlsconfig)
 			ctx := &Ctx{
-				fd_m:     new(sync.Map),
+				//fd_m:     new(sync.Map),
 				gnetconn: c,
 				server:   code.server,
 			}
