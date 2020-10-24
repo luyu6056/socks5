@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"sort"
 	"strings"
@@ -66,18 +67,14 @@ var (
 )
 
 type ServerConn struct {
-	fd      uint32 //每个服务器链接最多只有65535个fd连接
-	fd_m    *sync.Map
-	conn    net.Conn
-	tlsconn *tls.Conn
-
+	conn                          net.Conn
+	tlsconn                       *tls.Conn
 	inboundBuffer, outboundBuffer *tls.MsgBuffer
 	buf                           []byte
 	outbufchan, outChan           chan *serverOutBuf
 	wait                          chan int
 	addr                          *addr
-	pingtime                      int64
-	pongtime                      int64
+	pingtime, pongtime            int64
 	status                        int
 }
 type serverOutBuf struct {
@@ -104,7 +101,7 @@ type addr struct {
 const (
 	connWaitok = iota
 	connWaitclose
-	serverNum       = 4 //有效的连接数量
+	serverNum       = 1 //有效的连接数量
 	connAuthClose   = 0
 	connAuthNone    = 1
 	connAuthPw      = 2
@@ -130,32 +127,55 @@ func (s fdsort) Less(i, j int) bool {
 func (s fdsort) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
+
+var (
+	deleteIp   int32
+	networkMac string
+	fd_m       sync.Map
+	fd         uint32
+)
+
 func main() {
+	rand.Seed(time.Now().Unix())
+	interfaces, err := net.Interfaces()
+	for _, inter := range interfaces {
+		networkMac = inter.HardwareAddr.String()
+		if networkMac != "" {
+			break
+		}
+	}
+	if err != nil || networkMac == "" {
+		panic("无法获取网卡mac")
+	}
+	networkMac += strconv.Itoa(rand.Int())
 	hs := &httpServer{addr: "tcp://0.0.0.0:10808"}
 	go func() {
 		http.HandleFunc("/fd", func(w http.ResponseWriter, r *http.Request) {
 			str := []string{}
-			for k, server := range hs.netchan {
-				str = append(str, "server_id:"+strconv.Itoa(k))
-				var s fdsort
-				server.fd_m.Range(func(k, v interface{}) bool {
+			var s fdsort
+			fd_m.Range(func(k, v interface{}) bool {
 
-					s = append(s, v.(*Conn))
-					return true
-				})
-				sort.Sort(s)
-				for _, conn := range s {
-					if conn.close != "" {
-						str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+conn.close)
-					} else {
-						str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+strconv.Itoa(int(conn.windows_size)))
-					}
-
+				s = append(s, v.(*Conn))
+				return true
+			})
+			sort.Sort(s)
+			for _, conn := range s {
+				if conn.close != "" {
+					str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+conn.close)
+				} else {
+					str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+strconv.Itoa(int(conn.windows_size)))
 				}
 
 			}
-
 			w.Write([]byte(strings.Join(str, "\r\n")))
+		})
+		http.HandleFunc("/re", func(w http.ResponseWriter, r *http.Request) {
+
+			for _, server := range hs.netchan {
+				server.conn.Close()
+			}
+
+			w.Write([]byte("ok"))
 		})
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
@@ -166,11 +186,11 @@ func main() {
 	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
 	serverAddr = []*addr{
 
-		//{"202.81.230.173:3303", 0, 160 * 1024 * 1024, initWindowsSize},
+		//{"ip:port", 0, 160 * 1024 * 1024, initWindowsSize},
 	}
 
 	for i := 0; i < serverNum*len(serverAddr); i++ {
-		server := &ServerConn{fd_m: new(sync.Map), inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)]}
+		server := &ServerConn{inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)]}
 		server.buf = make([]byte, maxCiphertext)
 		hs.netchan = append(hs.netchan, server)
 
@@ -225,7 +245,7 @@ func (hs *httpServer) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 		<-conn.wait
 		conn.wait <- connWaitclose
 		conn.auth = connAuthClose
-		conn.server.fd_m.Delete(conn.fd)
+		fd_m.Delete(conn.fd)
 		c.SetContext(nil)
 		if conn.close == "" {
 			conn.close = "未知关闭"
@@ -316,13 +336,14 @@ func (conn *Conn) getfd(data []byte) {
 	buf := b.buf.Make(headlen + len(data))
 	b.c = conn
 	buf[0] = cmd_getfd //注册fd值
-	fd := uint16(atomic.AddUint32(&conn.server.fd, 1))
-	for _, ok := conn.server.fd_m.Load(fd); ok; _, ok = conn.server.fd_m.Load(fd) {
-		fd = uint16(atomic.AddUint32(&conn.server.fd, 1))
+	f := uint16(atomic.AddUint32(&fd, 1))
+	for _, ok := fd_m.Load(f); ok; _, ok = fd_m.Load(f) {
+		f = uint16(atomic.AddUint32(&fd, 1))
 	}
-	conn.fd[0] = byte(fd)
-	conn.fd[1] = byte(fd >> 8)
-	conn.server.fd_m.Store(conn.fd, conn)
+
+	conn.fd[0] = byte(f)
+	conn.fd[1] = byte(f >> 8)
+	fd_m.Store(conn.fd, conn)
 	buf[1] = conn.fd[0]
 	buf[2] = conn.fd[1]
 	copy(buf[headlen:], data)
@@ -380,7 +401,7 @@ func (server *ServerConn) do(msg []byte) {
 	var conn *Conn
 	switch msg[0] {
 	case cmd_fd:
-		if v, ok := server.fd_m.Load([2]byte{msg[1], msg[2]}); ok {
+		if v, ok := fd_m.Load([2]byte{msg[1], msg[2]}); ok {
 			conn = v.(*Conn)
 			flag := <-conn.wait
 			defer func() { conn.wait <- flag }()
@@ -400,7 +421,7 @@ func (server *ServerConn) do(msg []byte) {
 		}
 
 	case cmd_deletefd:
-		if v, ok := server.fd_m.Load([2]byte{msg[1], msg[2]}); ok {
+		if v, ok := fd_m.Load([2]byte{msg[1], msg[2]}); ok {
 			conn = v.(*Conn)
 			flag := <-conn.wait
 			defer func() { conn.wait <- flag }()
@@ -416,7 +437,7 @@ func (server *ServerConn) do(msg []byte) {
 		return
 	case cmd_msg:
 
-		if v, ok := server.fd_m.Load([2]byte{msg[1], msg[2]}); ok {
+		if v, ok := fd_m.Load([2]byte{msg[1], msg[2]}); ok {
 			conn = v.(*Conn)
 		} else {
 			return
@@ -450,11 +471,22 @@ func (server *ServerConn) do(msg []byte) {
 		if pingtime != server.pingtime {
 			return
 		}
+		server.pongtime = time.Now().UnixNano()
 		if server.addr.srtt == 0 {
-			server.addr.srtt = float32((time.Now().UnixNano() - pingtime) / 1e6)
+			server.addr.srtt = float32((server.pongtime - pingtime) / 1e6)
 		} else {
-			server.getRtt(time.Now().UnixNano() - pingtime)
+			server.getRtt(server.pongtime - pingtime)
 
+		}
+	case cmd_deleteIp:
+		if !atomic.CompareAndSwapInt32(&deleteIp, 0, 1) { //第一次连接服务器会返回一次删除，无视第一次
+			fmt.Println("删除所有")
+			fd_m.Range(func(k, v interface{}) bool {
+				v.(*Conn).c.Close()
+				fd_m.Delete(k)
+				return true
+
+			})
 		}
 
 	case cmd_msgresendno:
@@ -475,14 +507,10 @@ func (server *ServerConn) getRtt(timediff int64) {
 }
 
 func (server *ServerConn) reg() error {
-
+	server.pingtime = 0
+	server.pongtime = 0
 	var err error
-	server.fd_m.Range(func(k, v interface{}) bool { //强制关闭现有客户端连接
-		v.(*Conn).c.Close()
-		server.fd_m.Delete(k)
-		return true
 
-	})
 	server.conn, err = net.Dial("tcp", server.addr.addr)
 	if err != nil {
 
@@ -538,12 +566,14 @@ func (server *ServerConn) reg() error {
 			return err
 		}
 	}
-
-	b = make([]byte, maxPlaintext)
+	mac := []byte(networkMac)
+	b = make([]byte, len(mac)+1)
 	b[0] = cmd_reg
+	copy(b[1:], mac)
 	server.tlsconn.Write(b)
 	server.conn.Write(server.outboundBuffer.Bytes())
 	server.outboundBuffer.Reset()
+	b = make([]byte, maxPlaintext)
 	b[0] = 0
 	for i := 0; i < 7; i++ {
 		server.tlsconn.Write(b)
@@ -573,9 +603,12 @@ func handleOut(server *ServerConn) {
 		server.wait <- 0
 		now := time.Now()
 		if server.pingtime > server.pongtime {
-			server.getRtt(now.UnixNano() - server.pingtime)
+			server.conn.Close()
 		}
 		server.pingtime = now.UnixNano()
+		if server.pongtime == 0 {
+			server.pongtime = server.pingtime
+		}
 		pingtime := uint64(server.pingtime)
 		pingdata[1] = byte(pingtime & 255)
 		pingdata[2] = byte(pingtime >> 8 & 255)
