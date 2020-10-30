@@ -57,8 +57,9 @@ const (
 )
 
 var (
-	padding  = make([]byte, 15)
-	client_m sync.Map
+	padding    = make([]byte, 15)
+	client_m   sync.Map
+	clientLock sync.Mutex
 )
 
 type f翻墙 struct {
@@ -74,8 +75,9 @@ type mainServer struct {
 	pool *ants.Pool
 }
 type client struct {
-	fd_m sync.Map
-	key  string
+	fd_m   sync.Map
+	key    string
+	conn_m map[string]gnet.Conn
 }
 
 var gopool, _ = ants.NewPool(1024, ants.WithPreAlloc(true))
@@ -138,10 +140,11 @@ func main() {
 		log.Fatalf("certPool.AppendCertsFromPEM err")
 	}
 	go func() {
+		return
 		codec := &codec.Tlscodec{}
 		h := &mainServer{addr: "tcp://:808", pool: gopool}
 		go gnet.Serve(h, h.addr, gnet.WithLoopNum(4), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(32), gnet.WithMultiOut(false))
-		return
+
 		h443 := &mainServer{addr: "tcp://:443", pool: gopool}
 		gnet.Serve(h443, h443.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(64), gnet.WithMultiOut(false), gnet.WithTls(&tls.Config{
 			Certificates:             []tls.Certificate{cert},
@@ -185,7 +188,7 @@ func main() {
 		},
 	}
 
-	log.Fatal(gnet.Serve(f, f.addr, gnet.WithLoopNum(8), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(128), gnet.WithMultiOut(false)))
+	gnet.Serve(f, f.addr, gnet.WithLoopNum(3), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(32), gnet.WithMultiOut(false), gnet.WithTicker(true))
 }
 
 type Conn struct {
@@ -209,6 +212,17 @@ type Ctx struct {
 	server   *f翻墙
 }
 
+func (hs *f翻墙) Tick() (delay time.Duration, action gnet.Action) {
+	clientLock.Lock()
+	client_m.Range(func(k, c interface{}) bool {
+		if len(c.(*client).conn_m) == 0 {
+			client_m.Delete(k)
+		}
+		return true
+	})
+	clientLock.Unlock()
+	return time.Minute, gnet.None
+}
 func (hs *f翻墙) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	log.Printf("http server started on %s (loops: %d)", hs.addr, srv.NumEventLoop)
 	return
@@ -293,6 +307,15 @@ func (hs *f翻墙) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 				v.(*Conn).Close("客户端关闭链接")
 				return true
 			})
+			key := c.LocalAddr().String()
+			time.AfterFunc(time.Minute, func() {
+				clientLock.Lock()
+				if c1 := ctx.client.conn_m[key]; c1 == c {
+					delete(ctx.client.conn_m, key)
+				}
+
+				clientLock.Unlock()
+			})
 		}
 
 		c.SetContext(nil)
@@ -339,7 +362,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 				return
 			}
 
-			//被请求的地址 fmt.Println(addr)
+			fmt.Println(addr)//被请求的地址
 			rAddr, err := net.ResolveTCPAddr("tcp", addr)
 			if err != nil {
 				conn.Close("fd拨号失败")
@@ -421,31 +444,46 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		if ok {
 			conn := v.(*Conn)
 			windows_update_size := int64(data[3]) | int64(data[4])<<8 | int64(data[5])<<16 | int64(data[6])<<24 | int64(data[7])<<32 | int64(data[8])<<40 | int64(data[9])<<48 | int64(data[10])<<54
-
-			old := atomic.AddInt64(&conn.windows_size, windows_update_size) - windows_update_size
-			if old < 0 {
-				antspool.Submit(func() {
-					select {
-					case conn.wait <- true:
-					case <-time.After(time.Second):
-					}
-				})
+			if windows_update_size > 0 {
+				old := atomic.AddInt64(&conn.windows_size, windows_update_size) - windows_update_size
+				if old < 0 {
+					antspool.Submit(func() {
+						select {
+						case conn.wait <- true:
+						case <-time.After(time.Second):
+						}
+					})
+				}
 			}
+
+		} else {
+			b := make([]byte, 3)
+			b[0] = cmd_deletefd
+			b[1] = data[1]
+			b[2] = data[2]
+			c.AsyncWrite(b)
+			return
 		}
 	case cmd_reg:
-
+		clientLock.Lock()
+		defer clientLock.Unlock()
 		key := string(data[1:])
 		C := &client{key: key}
-		if v, ok := client_m.LoadOrStore(key, C); ok {
+		if v, ok := client_m.Load(key); ok {
 			ctx.client = v.(*client)
 			c.AsyncWrite(make([]byte, 65535*2)) //消灭分包
 		} else {
-			v, _ = client_m.Load(key)
-			ctx.client = v.(*client)
+			client_m.Store(key, C)
+			ctx.client = C
 			data[0] = cmd_deleteIp
 			c.AsyncWrite(data)                  //清空客户端的fd
 			c.AsyncWrite(make([]byte, 65535*2)) //消灭分包
 		}
+
+		if ctx.client.conn_m == nil {
+			ctx.client.conn_m = make(map[string]gnet.Conn)
+		}
+		ctx.client.conn_m[c.LocalAddr().String()] = c
 
 	case cmd_ping:
 		data[0] = cmd_pong

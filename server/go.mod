@@ -14,6 +14,6 @@ replace server/codec => ./codec
 
 replace server/config => ./config
 
-
+replace github.com/luyu6056/gnet => ../../luyu6056/gnet
 
 

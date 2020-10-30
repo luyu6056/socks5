@@ -72,10 +72,12 @@ type ServerConn struct {
 	inboundBuffer, outboundBuffer *tls.MsgBuffer
 	buf                           []byte
 	outbufchan, outChan           chan *serverOutBuf
-	wait                          chan int
+	inbufchan, inChan             chan *tls.MsgBuffer
+	regChan                       chan bool
 	addr                          *addr
 	pingtime, pongtime            int64
 	status                        int
+	tick                          *time.Ticker
 }
 type serverOutBuf struct {
 	buf *tls.MsgBuffer
@@ -101,7 +103,7 @@ type addr struct {
 const (
 	connWaitok = iota
 	connWaitclose
-	serverNum       = 1 //有效的连接数量
+	serverNum       = 4 //有效的连接数量
 	connAuthClose   = 0
 	connAuthNone    = 1
 	connAuthPw      = 2
@@ -169,6 +171,33 @@ func main() {
 			}
 			w.Write([]byte(strings.Join(str, "\r\n")))
 		})
+		http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+			vars := r.URL.Query()
+			if ids, ok := vars["id"]; ok {
+				id, err := strconv.Atoi(ids[0])
+				if err != nil {
+					w.Write([]byte("id错误"))
+					return
+				}
+				var fd [2]byte
+				fd[0] = byte(id)
+				fd[1] = byte(id >> 8)
+				if v, ok := fd_m.Load(fd); ok {
+					conn := v.(*Conn)
+					b := <-conn.server.outbufchan
+					b.c = conn
+					buf := b.buf.Make(headlen)
+					buf[0] = cmd_msg
+					buf[1] = conn.fd[0]
+					buf[2] = conn.fd[1]
+					conn.server.outChan <- b
+				} else {
+					w.Write([]byte("id不存在"))
+				}
+			} else {
+				w.Write([]byte("缺少参数"))
+			}
+		})
 		http.HandleFunc("/re", func(w http.ResponseWriter, r *http.Request) {
 
 			for _, server := range hs.netchan {
@@ -187,22 +216,55 @@ func main() {
 	serverAddr = []*addr{
 
 		//{"ip:port", 0, 160 * 1024 * 1024, initWindowsSize},
+
 	}
 
 	for i := 0; i < serverNum*len(serverAddr); i++ {
-		server := &ServerConn{inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)]}
+		server := &ServerConn{inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)], tick: time.NewTicker(time.Second * 5), regChan: make(chan bool, 1)}
 		server.buf = make([]byte, maxCiphertext)
 		hs.netchan = append(hs.netchan, server)
+		server.regChan <- true
+		server.handle()
 
-		handleOut(server)
-		go handleRemote(server)
 	}
 
-	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64))
+	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64), gnet.WithTicker(true))
 }
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	fmt.Println("listen", hs.addr, srv.NumEventLoop)
 	return
+}
+func (hs *httpServer) Tick() (delay time.Duration, action gnet.Action) {
+	fd_m.Range(func(k, v interface{}) bool {
+
+		conn := v.(*Conn)
+		windows_update_size := int64(conn.server.addr.windows_update_size)
+		size := windows_update_size - conn.windows_size
+		if size > 0 {
+			atomic.AddInt64(&conn.windows_size, size)
+		} else {
+			size = 0
+		}
+
+		b := <-conn.server.outbufchan
+		buf := b.buf.Make(11)
+		b.c = nil
+		buf[0] = cmd_windowsupdate
+		buf[1] = conn.fd[0]
+		buf[2] = conn.fd[1]
+		buf[3] = byte(size & 255)
+		buf[4] = byte(size >> 8 & 255)
+		buf[5] = byte(size >> 16 & 255)
+		buf[6] = byte(size >> 24 & 255)
+		buf[7] = byte(size >> 32 & 255)
+		buf[8] = byte(size >> 40 & 255)
+		buf[9] = byte(size >> 48 & 255)
+		buf[10] = byte(size >> 54 & 255)
+		conn.server.outChan <- b
+
+		return true
+	})
+	return time.Second * 10, gnet.None
 }
 
 var r = 1
@@ -355,43 +417,27 @@ func Bytes2str(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
 }
 
-func handleRemote(server *ServerConn) (err error) {
-	//先发送注册消息
+func (server *ServerConn) handleMessage() (err error) {
 	defer func() {
-		if server.status == statusON {
-			server.wait <- 0
-			server.status = statusOFF
-		}
-
-		if server.tlsconn != nil {
-			server.tlsconn = nil
-		}
-
-		if server.conn != nil {
-			server.conn.Close()
-		}
+		server.status = statusOFF
+		server.regChan <- true
 		fmt.Println("exit", err)
-		time.Sleep(time.Second * 10) //10秒后重试
-		go handleRemote(server)
+
 	}()
-	if err = server.reg(); err != nil {
-		return
-	}
-	//
 
 	for {
 		n, err := server.conn.Read(server.buf)
 		if err != nil {
-			fmt.Println("读错误1", err)
 			return err
 		}
 		server.tlsconn.RawWrite(server.buf[:n])
 		for err = server.tlsconn.ReadFrame(); err == nil && server.inboundBuffer.Len() > 0; err = server.tlsconn.ReadFrame() {
-			server.do(server.inboundBuffer.Bytes())
+			in := <-server.inbufchan
+			in.Write(server.inboundBuffer.Bytes())
 			server.inboundBuffer.Reset()
+			server.inChan <- in
 		}
 		if err != nil && err != io.EOF {
-			fmt.Println("读错误2", err)
 			return err
 		}
 
@@ -472,6 +518,7 @@ func (server *ServerConn) do(msg []byte) {
 			return
 		}
 		server.pongtime = time.Now().UnixNano()
+
 		if server.addr.srtt == 0 {
 			server.addr.srtt = float32((server.pongtime - pingtime) / 1e6)
 		} else {
@@ -480,7 +527,7 @@ func (server *ServerConn) do(msg []byte) {
 		}
 	case cmd_deleteIp:
 		if !atomic.CompareAndSwapInt32(&deleteIp, 0, 1) { //第一次连接服务器会返回一次删除，无视第一次
-			fmt.Println("删除所有")
+
 			fd_m.Range(func(k, v interface{}) bool {
 				v.(*Conn).c.Close()
 				fd_m.Delete(k)
@@ -581,27 +628,26 @@ func (server *ServerConn) reg() error {
 		server.outboundBuffer.Reset()
 	}
 	server.status = statusON
-	<-server.wait
 	fmt.Printf("connect to %s success\r\n", server.addr.addr)
 	return nil
 }
 
-func handleOut(server *ServerConn) {
+func (server *ServerConn) handle() {
 	bufnum := 128
 	server.outChan = make(chan *serverOutBuf, bufnum)
+	server.inChan = make(chan *tls.MsgBuffer, bufnum)
 	server.outbufchan = make(chan *serverOutBuf, bufnum)
+	server.inbufchan = make(chan *tls.MsgBuffer, bufnum)
 	for i := 0; i < bufnum; i++ {
 		server.outbufchan <- &serverOutBuf{buf: &tls.MsgBuffer{}}
+		server.inbufchan <- &tls.MsgBuffer{}
 	}
-	server.wait = make(chan int, 1)
-	server.wait <- 0
-	tick := time.NewTicker(time.Second * 5)
 
 	pingdata := make([]byte, 9)
-	pingdata[0] = cmd_ping
+
 	pingfunc := func() {
-		server.wait <- 0
 		now := time.Now()
+
 		if server.pingtime > server.pongtime {
 			server.conn.Close()
 		}
@@ -610,6 +656,7 @@ func handleOut(server *ServerConn) {
 			server.pongtime = server.pingtime
 		}
 		pingtime := uint64(server.pingtime)
+		pingdata[0] = cmd_ping
 		pingdata[1] = byte(pingtime & 255)
 		pingdata[2] = byte(pingtime >> 8 & 255)
 		pingdata[3] = byte(pingtime >> 16 & 255)
@@ -622,15 +669,36 @@ func handleOut(server *ServerConn) {
 
 		server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
-		<-server.wait
-	}
 
+	}
 	go func() {
-		pingfunc()
 		for {
 			select {
+			case <-server.regChan:
+				if server.tlsconn != nil {
+					server.tlsconn = nil
+				}
+				if server.conn != nil {
+					server.conn.Close()
+				}
+				server.tick.Stop()
+				time.Sleep(time.Second * 5) //等5秒后连接，避免频繁连接
+				err := server.reg()
+				if err != nil {
+
+					server.regChan <- true
+				} else {
+					pingfunc()
+					server.tick.Reset(time.Second * 10)
+					go server.handleMessage()
+				}
+
+			case in := <-server.inChan:
+				server.do(in.Bytes())
+				in.Reset()
+				server.inbufchan <- in
+
 			case b := <-server.outChan:
-				server.wait <- 0
 				if b.c != nil {
 					flag := <-b.c.wait
 					if flag == connWaitok {
@@ -661,13 +729,13 @@ func handleOut(server *ServerConn) {
 				}
 				server.conn.Write(server.outboundBuffer.Bytes())
 				server.outboundBuffer.Reset()
-				<-server.wait
-			case <-tick.C:
+			case <-server.tick.C:
 				pingfunc()
-			}
 
+			}
 		}
 	}()
+
 }
 
 func (conn *Conn) Remoteclose() {
