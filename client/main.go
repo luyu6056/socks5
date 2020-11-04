@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 
-	//"net/http"
 	"net/http"
 	_ "net/http/pprof"
 	"strconv"
@@ -30,7 +29,7 @@ const (
 	maxPlaintext    = 16384
 	outdelay        = time.Millisecond * 2
 	maxCiphertext   = maxPlaintext + 2048
-	initWindowsSize = maxPlaintext * 40
+	initWindowsSize = maxPlaintext * 20
 )
 const (
 	cmd_none        = iota
@@ -78,6 +77,7 @@ type ServerConn struct {
 	pingtime, pongtime            int64
 	status                        int
 	tick                          *time.Ticker
+	isPingConn                    bool //单独拉一个conn算窗口
 }
 type serverOutBuf struct {
 	buf *tls.MsgBuffer
@@ -94,9 +94,9 @@ type Conn struct {
 	close        string
 }
 type addr struct {
-	addr                string
-	srtt                float32 //单位 毫秒
-	bandwidth           uint64  //网络带宽 单位 字节/秒
+	addr string
+	srtt float32 //单位 毫秒
+	//bandwidth           uint64  //网络带宽 单位 字节/秒
 	windows_update_size uint64
 }
 
@@ -212,12 +212,8 @@ func main() {
 		}
 
 	}()
-	//连接服务器，设置srtt为0（初始值），设置带宽100M,默认初始窗口值,此处ip修改为server监听的ip端口
-	serverAddr = []*addr{
-
-		//{"ip:port", 0, 160 * 1024 * 1024, initWindowsSize},
-
-	}
+	//连接服务器，设置srtt为0（初始值,,默认初始窗口值,此处ip修改为server监听的ip端口
+	serverAddr = []*addr{}
 
 	for i := 0; i < serverNum*len(serverAddr); i++ {
 		server := &ServerConn{inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)], tick: time.NewTicker(time.Second * 5), regChan: make(chan bool, 1)}
@@ -228,7 +224,7 @@ func main() {
 
 	}
 
-	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64), gnet.WithTicker(true))
+	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64), gnet.WithTicker(true), gnet.WithMultiOut(true))
 }
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	fmt.Println("listen", hs.addr, srv.NumEventLoop)
@@ -418,6 +414,8 @@ func Bytes2str(b []byte) string {
 }
 
 func (server *ServerConn) handleMessage() (err error) {
+
+	server.tick.Reset(time.Second * 30)
 	defer func() {
 		server.status = statusOFF
 		server.regChan <- true
@@ -514,17 +512,20 @@ func (server *ServerConn) do(msg []byte) {
 
 	case cmd_pong:
 		pingtime := int64(msg[1]) | int64(msg[2])<<8 | int64(msg[3])<<16 | int64(msg[4])<<24 | int64(msg[5])<<32 | int64(msg[6])<<40 | int64(msg[7])<<48 | int64(msg[8])<<54
+
 		if pingtime != server.pingtime {
 			return
 		}
 		server.pongtime = time.Now().UnixNano()
-
-		if server.addr.srtt == 0 {
-			server.addr.srtt = float32((server.pongtime - pingtime) / 1e6)
-		} else {
-			server.getRtt(server.pongtime - pingtime)
-
+		if server.isPingConn {
+			fmt.Println(time.Now().Format("2006-01-02 15:04:05"))
+			if server.addr.srtt == 0 {
+				server.addr.srtt = float32((server.pongtime - pingtime) / 1e6)
+			} else {
+				server.getRtt(server.pongtime - pingtime)
+			}
 		}
+
 	case cmd_deleteIp:
 		if !atomic.CompareAndSwapInt32(&deleteIp, 0, 1) { //第一次连接服务器会返回一次删除，无视第一次
 
@@ -545,15 +546,25 @@ func (server *ServerConn) do(msg []byte) {
 	}
 }
 func (server *ServerConn) getRtt(timediff int64) {
-	server.addr.srtt = server.addr.srtt + 0.125*(float32(timediff)/1e6-server.addr.srtt) //srtt = srtt + 0.125(rtt-srtt)
+	/*server.addr.srtt = server.addr.srtt + 0.125*(float32(timediff)/1e6-server.addr.srtt) //srtt = srtt + 0.125(rtt-srtt)
 	//计算一个新的窗口值，由于rtt不是实时获取，不能做那种实时的变动的rtt窗口
-	server.addr.windows_update_size = server.addr.bandwidth / 1000 * uint64(server.addr.srtt)
+	server.addr.windows_update_size = server.addr.bandwidth / 1000 * uint64(server.addr.srtt) / 100
+	fmt.Println(server.addr.windows_update_size)
 	if server.addr.windows_update_size < 163840 {
 		server.addr.windows_update_size = 163840
-	}
+	}*/
+
 }
 
 func (server *ServerConn) reg() error {
+	if server.tlsconn != nil {
+		server.tlsconn = nil
+	}
+	if server.conn != nil {
+		server.conn.Close()
+	}
+	server.tick.Stop()
+	time.Sleep(time.Second * 5) //等5秒后连接，避免频繁连接
 	server.pingtime = 0
 	server.pongtime = 0
 	var err error
@@ -633,7 +644,7 @@ func (server *ServerConn) reg() error {
 }
 
 func (server *ServerConn) handle() {
-	bufnum := 128
+	bufnum := 64
 	server.outChan = make(chan *serverOutBuf, bufnum)
 	server.inChan = make(chan *tls.MsgBuffer, bufnum)
 	server.outbufchan = make(chan *serverOutBuf, bufnum)
@@ -649,6 +660,11 @@ func (server *ServerConn) handle() {
 		now := time.Now()
 
 		if server.pingtime > server.pongtime {
+
+			ping := time.Unix(0, server.pingtime)
+
+			pong := time.Unix(0, server.pongtime)
+			fmt.Println("超时", ping.Format("2006-01-02 15:04:05"), pong.Format("2006-01-02 15:04:05"))
 			server.conn.Close()
 		}
 		server.pingtime = now.UnixNano()
@@ -675,21 +691,11 @@ func (server *ServerConn) handle() {
 		for {
 			select {
 			case <-server.regChan:
-				if server.tlsconn != nil {
-					server.tlsconn = nil
-				}
-				if server.conn != nil {
-					server.conn.Close()
-				}
-				server.tick.Stop()
-				time.Sleep(time.Second * 5) //等5秒后连接，避免频繁连接
 				err := server.reg()
 				if err != nil {
-
 					server.regChan <- true
 				} else {
 					pingfunc()
-					server.tick.Reset(time.Second * 10)
 					go server.handleMessage()
 				}
 
@@ -697,7 +703,13 @@ func (server *ServerConn) handle() {
 				server.do(in.Bytes())
 				in.Reset()
 				server.inbufchan <- in
-
+				//尽量清空消息以接收pong避免频繁超时断连
+				for i := 0; i < len(server.inChan); i++ {
+					in := <-server.inChan
+					server.do(in.Bytes())
+					in.Reset()
+					server.inbufchan <- in
+				}
 			case b := <-server.outChan:
 				if b.c != nil {
 					flag := <-b.c.wait
@@ -730,6 +742,13 @@ func (server *ServerConn) handle() {
 				server.conn.Write(server.outboundBuffer.Bytes())
 				server.outboundBuffer.Reset()
 			case <-server.tick.C:
+				//尽量清空消息以接收pong避免频繁超时断连
+				for i := 0; i < len(server.inChan); i++ {
+					in := <-server.inChan
+					server.do(in.Bytes())
+					in.Reset()
+					server.inbufchan <- in
+				}
 				pingfunc()
 
 			}
