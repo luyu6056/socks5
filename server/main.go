@@ -56,6 +56,26 @@ const (
 	cmd_reg
 )
 
+var cmdToName = map[uint8]string{
+	cmd_none:          "cmd_none",
+	cmd_getfd:         "cmd_getfd",
+	cmd_fd:            "cmd_fd",
+	cmd_msg:           "cmd_msg",
+	cmd_msgend:        "cmd_msgend",
+	cmd_msgrec:        "cmd_msgrec",
+	cmd_msgresend:     "cmd_msgresend",
+	cmd_deletefd:      "cmd_deletefd",
+	cmd_msgresendno:   "cmd_msgresendno",
+	cmd_windowsupdate: "cmd_windowsupdate",
+	cmd_ping:          "cmd_ping",
+	cmd_pong:          "cmd_pong",
+	udpcheckIn:        "udpcheckIn",
+	udpcheckOut:       "udpcheckOut",
+	udpcheckMsg:       "udpcheckMsg",
+	udpcheckRecno:     "udpcheckRecno",
+	cmd_deleteIp:      "cmd_deleteIp",
+	cmd_reg:           "cmd_reg",
+}
 var (
 	padding    = make([]byte, 15)
 	client_m   sync.Map
@@ -140,11 +160,11 @@ func main() {
 		log.Fatalf("certPool.AppendCertsFromPEM err")
 	}
 	go func() {
-		return
+
 		codec := &codec.Tlscodec{}
 		h := &mainServer{addr: "tcp://:808", pool: gopool}
 		go gnet.Serve(h, h.addr, gnet.WithLoopNum(4), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(32), gnet.WithMultiOut(false))
-
+		return
 		h443 := &mainServer{addr: "tcp://:443", pool: gopool}
 		gnet.Serve(h443, h443.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(64), gnet.WithMultiOut(false), gnet.WithTls(&tls.Config{
 			Certificates:             []tls.Certificate{cert},

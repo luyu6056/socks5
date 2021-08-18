@@ -25,11 +25,13 @@ import (
 )
 
 const (
+	serverNum       = 4 //有效的连接数量
 	headlen         = 3 //1cmd2fd
 	maxPlaintext    = 16384
 	outdelay        = time.Millisecond * 2
 	maxCiphertext   = maxPlaintext + 2048
 	initWindowsSize = maxPlaintext * 20
+	writeDeadline   = time.Second * 5
 )
 const (
 	cmd_none        = iota
@@ -51,6 +53,28 @@ const (
 	cmd_deleteIp //重启要求删除远程资源
 	cmd_reg
 )
+
+var cmdToName = map[uint8]string{
+	cmd_none:          "cmd_none",
+	cmd_getfd:         "cmd_getfd",
+	cmd_fd:            "cmd_fd",
+	cmd_msg:           "cmd_msg",
+	cmd_msgend:        "cmd_msgend",
+	cmd_msgrec:        "cmd_msgrec",
+	cmd_msgresend:     "cmd_msgresend",
+	cmd_deletefd:      "cmd_deletefd",
+	cmd_msgresendno:   "cmd_msgresendno",
+	cmd_windowsupdate: "cmd_windowsupdate",
+	cmd_ping:          "cmd_ping",
+	cmd_pong:          "cmd_pong",
+	udpcheckIn:        "udpcheckIn",
+	udpcheckOut:       "udpcheckOut",
+	udpcheckMsg:       "udpcheckMsg",
+	udpcheckRecno:     "udpcheckRecno",
+	cmd_deleteIp:      "cmd_deleteIp",
+	cmd_reg:           "cmd_reg",
+}
+
 const (
 	statusOFF = 0
 	statusON  = 1
@@ -74,7 +98,7 @@ type ServerConn struct {
 	inbufchan, inChan             chan *tls.MsgBuffer
 	regChan                       chan bool
 	addr                          *addr
-	pingtime, pongtime            int64
+	pingtime, pongtime, rectime   int64
 	status                        int
 	tick                          *time.Ticker
 	isPingConn                    bool //单独拉一个conn算窗口
@@ -103,7 +127,7 @@ type addr struct {
 const (
 	connWaitok = iota
 	connWaitclose
-	serverNum       = 4 //有效的连接数量
+
 	connAuthClose   = 0
 	connAuthNone    = 1
 	connAuthPw      = 2
@@ -213,10 +237,12 @@ func main() {
 
 	}()
 	//连接服务器，设置srtt为0（初始值,,默认初始窗口值,此处ip修改为server监听的ip端口
-	serverAddr = []*addr{}
+	serverAddr = []*addr{
+		{"127.0.0.1:3303", 0, initWindowsSize},
+	}
 
 	for i := 0; i < serverNum*len(serverAddr); i++ {
-		server := &ServerConn{inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)], tick: time.NewTicker(time.Second * 5), regChan: make(chan bool, 1)}
+		server := &ServerConn{inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)], tick: time.NewTicker(time.Second * 10), regChan: make(chan bool, 1)}
 		server.buf = make([]byte, maxCiphertext)
 		hs.netchan = append(hs.netchan, server)
 		server.regChan <- true
@@ -279,6 +305,8 @@ func (hs *httpServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 			if server := hs.netchan[index+i]; server.status == statusON && server.addr.srtt < srtt {
 				srtt = server.addr.srtt
 				id = index + i
+			} else {
+				//fmt.Printf("序号%d status:%v  srtt:%v \r\n",index+i, server.status,server.addr.srtt)
 			}
 
 		}
@@ -434,6 +462,7 @@ func (server *ServerConn) handleMessage() (err error) {
 			in.Write(server.inboundBuffer.Bytes())
 			server.inboundBuffer.Reset()
 			server.inChan <- in
+			server.rectime = time.Now().UnixNano()
 		}
 		if err != nil && err != io.EOF {
 			return err
@@ -489,6 +518,7 @@ func (server *ServerConn) do(msg []byte) {
 		conn.c.AsyncWrite(msg[headlen:])
 		windows_size := atomic.AddInt64(&conn.windows_size, int64(headlen-len(msg)))
 		windows_update_size := int64(conn.server.addr.windows_update_size)
+
 		if windows_size < windows_update_size/2 { //扩大窗口
 			if size := windows_update_size - conn.windows_size; size > 0 {
 				atomic.AddInt64(&conn.windows_size, size)
@@ -635,8 +665,13 @@ func (server *ServerConn) reg() error {
 	b[0] = 0
 	for i := 0; i < 7; i++ {
 		server.tlsconn.Write(b)
-		server.conn.Write(server.outboundBuffer.Bytes())
+		server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+		_, err = server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
+		if err != nil {
+			return err
+		}
+
 	}
 	server.status = statusON
 	fmt.Printf("connect to %s success\r\n", server.addr.addr)
@@ -659,12 +694,8 @@ func (server *ServerConn) handle() {
 	pingfunc := func() {
 		now := time.Now()
 
-		if server.pingtime > server.pongtime {
-
-			ping := time.Unix(0, server.pingtime)
-
-			pong := time.Unix(0, server.pongtime)
-			fmt.Println("超时", ping.Format("2006-01-02 15:04:05"), pong.Format("2006-01-02 15:04:05"))
+		if server.pingtime > server.pongtime && server.pingtime > server.rectime {
+			//fmt.Println(time.Now().String(), "超时", server.pingtime, server.pongtime, server.rectime)
 			server.conn.Close()
 		}
 		server.pingtime = now.UnixNano()
@@ -682,18 +713,22 @@ func (server *ServerConn) handle() {
 		pingdata[7] = byte(pingtime >> 48 & 255)
 		pingdata[8] = byte(pingtime >> 54 & 255)
 		server.tlsconn.Write(pingdata)
-
-		server.conn.Write(server.outboundBuffer.Bytes())
+		server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+		_, err := server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
+		if err != nil {
+			server.conn.Close()
+		}
 
 	}
 	go func() {
 		for {
 			select {
 			case <-server.regChan:
+			reConnet:
 				err := server.reg()
 				if err != nil {
-					server.regChan <- true
+					goto reConnet
 				} else {
 					pingfunc()
 					go server.handleMessage()
@@ -739,8 +774,12 @@ func (server *ServerConn) handle() {
 					b.buf.Reset()
 					server.outbufchan <- b
 				}
-				server.conn.Write(server.outboundBuffer.Bytes())
+				server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+				_, err := server.conn.Write(server.outboundBuffer.Bytes())
 				server.outboundBuffer.Reset()
+				if err != nil {
+					server.conn.Close()
+				}
 			case <-server.tick.C:
 				//尽量清空消息以接收pong避免频繁超时断连
 				for i := 0; i < len(server.inChan); i++ {
@@ -850,14 +889,19 @@ func (server *ServerConn) Write(b []byte) (int, error) {
 	if server.conn == nil {
 		return 0, io.EOF
 	}
+	var err error
 	if server.tlsconn != nil {
-		server.conn.Write(server.outboundBuffer.Bytes())
+		server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+		_, err = server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
+
 	} else {
-		server.conn.Write(b)
+		server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+		_, err = server.conn.Write(b)
+
 	}
 
-	return len(b), nil
+	return len(b), err
 }
 
 func (server *ServerConn) BufferLength() int {
