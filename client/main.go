@@ -297,7 +297,7 @@ func (hs *httpServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 	conn.auth = connAuthNone
 	conn.remote = connRemoteClose
 	id := -1
-	for id == -1 {
+	for n := 0; n < 60 && id == -1; n++ {
 		r++
 		srtt := float32(99999999)
 		index := r % serverNum * len(serverAddr)
@@ -314,6 +314,9 @@ func (hs *httpServer) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
 			time.Sleep(time.Second)
 		}
 
+	}
+	if id == -1 {
+		return nil, gnet.Close
 	}
 	//r++
 
