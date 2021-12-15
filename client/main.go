@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"sort"
@@ -25,7 +26,6 @@ import (
 )
 
 const (
-	serverNum       = 4 //有效的连接数量
 	headlen         = 3 //1cmd2fd
 	maxPlaintext    = 16384
 	outdelay        = time.Millisecond * 2
@@ -102,6 +102,7 @@ type ServerConn struct {
 	status                        int
 	tick                          *time.Ticker
 	isPingConn                    bool //单独拉一个conn算窗口
+	index                         int
 }
 type serverOutBuf struct {
 	buf *tls.MsgBuffer
@@ -127,7 +128,7 @@ type addr struct {
 const (
 	connWaitok = iota
 	connWaitclose
-
+	serverNum       = 4 //有效的连接数量
 	connAuthClose   = 0
 	connAuthNone    = 1
 	connAuthPw      = 2
@@ -238,11 +239,11 @@ func main() {
 	}()
 	//连接服务器，设置srtt为0（初始值,,默认初始窗口值,此处ip修改为server监听的ip端口
 	serverAddr = []*addr{
-		{"127.0.0.1:3303", 0, initWindowsSize},
+		{"127.0.0.1:3306", 0, initWindowsSize},
 	}
 
 	for i := 0; i < serverNum*len(serverAddr); i++ {
-		server := &ServerConn{inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)], tick: time.NewTicker(time.Second * 10), regChan: make(chan bool, 1)}
+		server := &ServerConn{index: i, inboundBuffer: &tls.MsgBuffer{}, outboundBuffer: &tls.MsgBuffer{}, addr: serverAddr[i%len(serverAddr)], tick: time.NewTicker(time.Second * 10), regChan: make(chan bool, 1)}
 		server.buf = make([]byte, maxCiphertext)
 		hs.netchan = append(hs.netchan, server)
 		server.regChan <- true
@@ -351,22 +352,25 @@ func (hs *httpServer) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 
 func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 
-	conn := c.Context().(*Conn)
+	conn, ok := c.Context().(*Conn)
+	if !ok {
+		return gnet.Close
+	}
 
 	switch conn.auth {
 	case connAuthNone:
 		if len(data) > 2 {
 			if Bytes2str(data[:3]) == socks5_auth {
-				c.AsyncWrite(socks5_auth_sussces)
+				c.FlushWrite(socks5_auth_sussces)
 				conn.auth = connAuthOk
 			}
 			if Bytes2str(data[:3]) == socks5_authpwd {
-				c.AsyncWrite(socks5_authpwd_sussces)
+				c.FlushWrite(socks5_authpwd_sussces)
 				conn.auth = connAuthPw
 			}
 		}
 	case connAuthPw:
-		c.AsyncWrite([]byte{1, 0})
+		c.FlushWrite([]byte{1, 0})
 		conn.auth = connAuthOk
 	case connAuthOk:
 
@@ -379,11 +383,11 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 
 			conn.getfd(append(bytes.Join(str, []byte{46}), data[len(data)-2:]...))
 			conn.auth = connAuthMessage
-			c.AsyncWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+			c.FlushWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 		case 3: //域名
 			conn.getfd(data[5:])
 			conn.auth = connAuthMessage
-			c.AsyncWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+			c.FlushWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 		case 4: //ipv6
 		}
 	case connAuthMessage:
@@ -420,7 +424,6 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 }
 
 func (conn *Conn) getfd(data []byte) {
-
 	b := <-conn.server.outbufchan
 	buf := b.buf.Make(headlen + len(data))
 	b.c = conn
@@ -455,8 +458,12 @@ func (server *ServerConn) handleMessage() (err error) {
 	}()
 
 	for {
+		server.conn.SetReadDeadline(time.Now().Add(writeDeadline))
 		n, err := server.conn.Read(server.buf)
 		if err != nil {
+			if strings.Contains(err.Error(), "i/o timeout") {
+				continue
+			}
 			return err
 		}
 		server.tlsconn.RawWrite(server.buf[:n])
@@ -464,8 +471,9 @@ func (server *ServerConn) handleMessage() (err error) {
 			in := <-server.inbufchan
 			in.Write(server.inboundBuffer.Bytes())
 			server.inboundBuffer.Reset()
+			server.rectime = time.Now().Unix()
 			server.inChan <- in
-			server.rectime = time.Now().UnixNano()
+
 		}
 		if err != nil && err != io.EOF {
 			return err
@@ -490,9 +498,9 @@ func (server *ServerConn) do(msg []byte) {
 		}
 		if msg[3] == 1 {
 			conn.auth = 3
-			conn.c.AsyncWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+			conn.c.FlushWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 		} else {
-			conn.c.AsyncWrite([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+			conn.c.FlushWrite([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
 			conn.c.Close()
 		}
 
@@ -518,7 +526,7 @@ func (server *ServerConn) do(msg []byte) {
 		} else {
 			return
 		}
-		conn.c.AsyncWrite(msg[headlen:])
+		conn.c.FlushWrite(msg[headlen:])
 		windows_size := atomic.AddInt64(&conn.windows_size, int64(headlen-len(msg)))
 		windows_update_size := int64(conn.server.addr.windows_update_size)
 
@@ -549,7 +557,7 @@ func (server *ServerConn) do(msg []byte) {
 		if pingtime != server.pingtime {
 			return
 		}
-		server.pongtime = time.Now().UnixNano()
+		server.pongtime = time.Now().Unix()
 		if server.isPingConn {
 			fmt.Println(time.Now().Format("2006-01-02 15:04:05"))
 			if server.addr.srtt == 0 {
@@ -590,6 +598,8 @@ func (server *ServerConn) getRtt(timediff int64) {
 }
 
 func (server *ServerConn) reg() error {
+	server.pingtime = 0
+	server.pongtime = 0
 	if server.tlsconn != nil {
 		server.tlsconn = nil
 	}
@@ -598,8 +608,7 @@ func (server *ServerConn) reg() error {
 	}
 	server.tick.Stop()
 	time.Sleep(time.Second * 5) //等5秒后连接，避免频繁连接
-	server.pingtime = 0
-	server.pongtime = 0
+
 	var err error
 
 	server.conn, err = net.Dial("tcp", server.addr.addr)
@@ -609,9 +618,10 @@ func (server *ServerConn) reg() error {
 
 	}
 	server.inboundBuffer.Reset()
+	server.conn.SetReadDeadline(time.Now().Add(writeDeadline))
 	n, err := server.conn.Read(server.inboundBuffer.Make(1024))
 	if err != nil {
-		//libraries.DEBUG("这里", err)
+		log.Println("这里4", err)
 		return err
 	}
 	if n < 4 {
@@ -626,7 +636,7 @@ func (server *ServerConn) reg() error {
 	for olen := server.inboundBuffer.Len(); olen < msglen; olen = server.inboundBuffer.Len() {
 		n, err := server.conn.Read(server.inboundBuffer.Make(msglen))
 		if err != nil {
-			//libraries.DEBUG("这里")
+			log.Println("这里3")
 			return err
 		}
 		server.inboundBuffer.Truncate(olen + n)
@@ -648,6 +658,7 @@ func (server *ServerConn) reg() error {
 		for data := server.tlsconn.RawData(); len(data) < 5 || int(data[3])<<8|int(data[4])+5 > len(data); data = server.tlsconn.RawData() {
 			n, err := server.conn.Read(server.buf)
 			if err != nil {
+				log.Println("这里2")
 				return err
 			}
 			server.tlsconn.RawWrite(server.buf[:n])
@@ -672,9 +683,9 @@ func (server *ServerConn) reg() error {
 		_, err = server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
 		if err != nil {
+			log.Println("这里1")
 			return err
 		}
-
 	}
 	server.status = statusON
 	fmt.Printf("connect to %s success\r\n", server.addr.addr)
@@ -696,12 +707,11 @@ func (server *ServerConn) handle() {
 
 	pingfunc := func() {
 		now := time.Now()
-
 		if server.pingtime > server.pongtime && server.pingtime > server.rectime {
-			//fmt.Println(time.Now().String(), "超时", server.pingtime, server.pongtime, server.rectime)
+			fmt.Println(time.Now().Format("2006-01-02 15:04:05"), server.index, "超时", server.pingtime, server.pongtime, server.rectime)
 			server.conn.Close()
 		}
-		server.pingtime = now.UnixNano()
+		server.pingtime = now.Unix()
 		if server.pongtime == 0 {
 			server.pongtime = server.pingtime
 		}
@@ -897,7 +907,6 @@ func (server *ServerConn) Write(b []byte) (int, error) {
 		server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 		_, err = server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
-
 	} else {
 		server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 		_, err = server.conn.Write(b)
