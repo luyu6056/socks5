@@ -8,9 +8,12 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -116,8 +119,7 @@ func nextTokenOrQuoted(s string) (value string, rest string) {
 				case b == '\\':
 					escape = true
 				case b == '"':
-					tmp := p[:j]
-					return *(*string)(unsafe.Pointer(&tmp)), s[i+1:]
+					return Bytes2str(p[:j]), s[i+1:]
 				default:
 					p[j] = b
 					j += 1
@@ -213,4 +215,30 @@ headers:
 		}
 	}
 	return result
+}
+
+var project_dir string
+
+func DebugLog(format string, v ...interface{}) {
+
+	_, file, line, ok := runtime.Caller(1)
+	if ok {
+		v = append([]interface{}{fmt.Sprintf("%s %s,line %d:", time.Now().Format("2006-01-02 15:04:05"), file[len(project_dir):], line)}, v...)
+	}
+	fmt.Printf("%s "+format+"\r\n", v...)
+}
+func init() {
+
+	var _, publicfilename, _, _ = runtime.Caller(0)
+	publicPath := strings.Split(publicfilename, "/")
+	project_dir = strings.Join(publicPath[:len(publicPath)-2], "/")
+}
+func Str2bytes(s string) []byte {
+	x := (*[2]uintptr)(unsafe.Pointer(&s))
+	h := [3]uintptr{x[0], x[1], x[1]}
+	return *(*[]byte)(unsafe.Pointer(&h))
+}
+
+func Bytes2str(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
 }

@@ -2,10 +2,20 @@ package codec
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"net/url"
+	"regexp"
+
+	"github.com/klauspost/compress/gzip"
+	"github.com/luyu6056/cache"
+	"github.com/luyu6056/tls"
+
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -13,9 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/klauspost/compress/gzip"
+	"github.com/fsnotify/fsnotify"
 	"github.com/luyu6056/gnet"
-	"github.com/luyu6056/tls"
 	"github.com/panjf2000/ants/v2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -32,17 +41,19 @@ type Http2server struct {
 	}
 	WorkStream      *Http2stream
 	ReadPool        *ants.Pool
-	SendPool        *ants.PoolWithFunc
+	SendPool        *ants.Pool
 	Streams         []*Http2stream
 	ReadMetaHeaders *hpack.Decoder
 	last_stream_id  uint32
 	fps             uint32 //Frames Per Second,避免一些如CVE-2019-9512和CVE-2019-9515 ddos攻击，其实是限制客户端帧请求
-	//IN_WINDOW_SIZE  int32  //接受到的窗口允许大小
-	//OUT_WINDOW_SIZE int32  //发送出去的窗口允许大小
-	lock sync.Mutex
+	//IN_WINDOW_SIZE  int32 //接受到的窗口允许大小
+	//OUT_WINDOW_SIZE int32 //发送出去的窗口允许大小
+	//lock            sync.Mutex
+	Conn   *ClientConn
+	Origin string
 }
 type Http2stream struct {
-	Out                             *tls.MsgBuffer
+	Out, Out2                       *tls.MsgBuffer
 	Headers                         []hpack.HeaderField
 	In                              *tls.MsgBuffer
 	Id                              uint32
@@ -54,6 +65,18 @@ type Http2stream struct {
 	headerbuf                       tls.MsgBuffer
 	data                            *bytes.Reader
 	compressbuf                     *tls.MsgBuffer
+	query                           map[string][]string
+	cookie                          map[string]string
+	post                            map[string][]string
+	session                         *cache.Hashvalue
+	method, path, uri               string
+	outCode                         int
+	OutContentType                  string
+	OutHeader                       map[string]string
+	OutCookie                       map[string]httpcookie
+	content_type                    string
+	accept_encoding                 string
+	referer                         string
 }
 
 const (
@@ -79,6 +102,7 @@ func NewH2Conn(c gnet.Conn) *Http2server {
 	h2s.Setting.MAX_HEADER_LIST_SIZE = 0
 	h2s.Streams[0].OUT_WINDOW_SIZE = http2initialWindowSize
 	h2s.Streams[0].IN_WINDOW_SIZE = http2serverWindowSize
+	h2s.Streams[0].Out.Reset()
 	h2s.SendPool.Tune(http2MaxConcurrentStreams)
 	h2s.SendPool.Reboot()
 	h2s.c = c
@@ -89,8 +113,8 @@ func NewH2Conn(c gnet.Conn) *Http2server {
 	return h2s
 }
 func (h2s *Http2server) Close() {
+	h2s.connError(http2ErrCodeNo)
 	h2s.SendPool.Release()
-
 	for h2s.SendPool.Running() > 0 {
 		for _, stream := range h2s.Streams {
 			if stream != nil {
@@ -102,13 +126,12 @@ func (h2s *Http2server) Close() {
 		}
 		time.Sleep(time.Second)
 	}
-
 	Http2pool.Put(h2s)
 }
 
 const (
 	http2serverWindowSize       = (1 << 31) - 1 - http2initialWindowSize //服务器窗口
-	http2fpslimit               = 99999999                               //帧率限制，避免ddos攻击
+	http2fpslimit               = 999                                    //帧率限制，避免ddos攻击
 	http2WindowsSizeWaitTimeout = time.Second * 10                       //当窗口值为负的时候，会chan等待新的窗口增加，异步运行的时候也许会出现updatewindows没发送chan，导致流的chan锁死，所以为负值时候update会强行发送chan，但是也怕强行发送chan卡死，所以加了个超时
 	http2MaxConcurrentStreams   = 256
 	http2headerlength           = 9
@@ -231,7 +254,7 @@ func (e http2ConnectionError) Error() string {
 var Http2pool = sync.Pool{New: func() interface{} {
 	hs := &Http2server{}
 	hs.ReadPool, _ = ants.NewPool(http2MaxConcurrentStreams)
-	hs.SendPool, _ = ants.NewPoolWithFunc(http2MaxConcurrentStreams, sendpool_static)
+	hs.SendPool, _ = ants.NewPool(http2MaxConcurrentStreams)
 	hs.Streams = make([]*Http2stream, http2MaxConcurrentStreams)
 	hs.Streams[0] = &Http2stream{sendch: make(chan int8), Out: &tls.MsgBuffer{}}
 	hs.ReadMetaHeaders = hpack.NewDecoder(http2initialHeaderTableSize, nil)
@@ -242,6 +265,7 @@ var Http2pool = sync.Pool{New: func() interface{} {
 
 //发送一个goaway顺便返回error
 func (h2s *Http2server) connError(code http2ErrCode) error {
+
 	stream := h2s.Streams[0]
 	stream.Out.Reset()
 	outbuf := stream.Out.Make(http2headerlength + 8)
@@ -267,7 +291,7 @@ func (h2s *Http2server) connError(code http2ErrCode) error {
 }
 
 var stream_pool = sync.Pool{New: func() interface{} {
-	hs := &Http2stream{Out: &tls.MsgBuffer{}, In: tls.NewBuffer(0)}
+	hs := &Http2stream{Out: &tls.MsgBuffer{}, Out2: &tls.MsgBuffer{}, In: tls.NewBuffer(0)}
 	hs.sendch = make(chan int8)
 	hs.data = &bytes.Reader{}
 	hs.compressbuf = &tls.MsgBuffer{}
@@ -323,6 +347,8 @@ var (
 	headerField_status200            = hpack.HeaderField{Name: ":status", Value: "200"}
 	headerField_status206            = hpack.HeaderField{Name: ":status", Value: "206"}
 	headerField_status404            = hpack.HeaderField{Name: ":status", Value: "404"}
+	headerField_status302            = hpack.HeaderField{Name: ":status", Value: "302"}
+	headerField_status500            = hpack.HeaderField{Name: ":status", Value: "500"}
 	headerField_cachecontrol         = hpack.HeaderField{Name: "cache-control", Value: "max-age=86400"}
 	headerField_nocache              = hpack.HeaderField{Name: "cache-control", Value: "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0"}
 	headerField_server               = hpack.HeaderField{Name: "server", Value: "gnet by luyu6056"}
@@ -337,8 +363,8 @@ var (
 	headerField_content_type_css     = hpack.HeaderField{Name: "content-type", Value: "text/css"}
 	headerField_content_type_default = hpack.HeaderField{Name: "content-type", Value: "application/octet-stream"}
 	headerField_Accept_Ranges        = hpack.HeaderField{Name: "accept-ranges", Value: "bytes"}
+	//headerField_allow_origin         = hpack.HeaderField{Name: "access-control-allow-origin", Value: config.Server.Origin}
 )
-var static_cache sync.Map
 
 type file_cache struct {
 	deflatefile     []byte
@@ -348,29 +374,19 @@ type file_cache struct {
 	modTime         int64
 	file            []byte
 	check           uint32 //1秒钟检查1次
+	iscompress      bool
 }
 
-var sendpool_static = func(i interface{}) {
-	stream, ok := i.(*Http2stream)
-	if !ok || stream.Id == 0 { //主steam不允许处理data
-		return
-	}
-	stream.headerbuf.Reset()
-	stream.henc = hpack.NewEncoder(&stream.headerbuf)
+var h2_context_pool = sync.Pool{New: func() interface{} {
+	return &Context{Buf: new(tls.MsgBuffer), In: new(tls.MsgBuffer), In2: new(tls.MsgBuffer)}
+}}
+
+func (stream *Http2stream) StaticHandler() (action gnet.Action) {
 	var filename string
 	etag := ""
-	var deflate, isgzip bool
 	var range_start, range_end int
 	for _, head := range stream.Headers {
-
 		switch head.Name {
-		case ":path":
-			filename = head.Value
-		case "accept-encoding":
-			deflate = strings.Contains(head.Value, "deflate")
-			if !deflate {
-				isgzip = strings.Contains(head.Value, "gzip")
-			}
 		case "if-match", "if-none-match":
 			etag = head.Value
 		case "range":
@@ -382,7 +398,24 @@ var sendpool_static = func(i interface{}) {
 				}
 
 			}
+		case ":method":
+			switch head.Value {
+			case "OPTIONS":
+				stream.henc.WriteField(headerField_status200)
+				if stream.svr.Origin != "" {
+					stream.henc.WriteField(hpack.HeaderField{Name: "access-control-allow-origin", Value: stream.svr.Origin})
+				}
+
+				stream.WriteData(nil, 0)
+				return
+			}
 		}
+	}
+	var deflate, isgzip bool
+	filename = stream.path
+	deflate = strings.Contains(stream.accept_encoding, "deflate")
+	if !deflate {
+		isgzip = strings.Contains(stream.accept_encoding, "gzip")
 	}
 	if index := strings.IndexByte(filename, '?'); index > 0 {
 		filename = filename[:index]
@@ -390,206 +423,93 @@ var sendpool_static = func(i interface{}) {
 	if filename == "/" {
 		filename = "/index.html"
 	}
-	switch filename {
-	case "/hello":
-		stream.henc.WriteField(headerField_status200)
-		stream.henc.WriteField(headerField_nocache)
-		stream.data.Reset([]byte("hello word!"))
-		stream.WriteData(stream.data, stream.data.Len())
-		return
-	case "/getIP":
-		stream.henc.WriteField(headerField_status200)
-		stream.henc.WriteField(headerField_nocache)
-		stream.data.Reset([]byte(`{"processedString":"` + stream.svr.c.RemoteAddr().String() + `"}`))
-		stream.WriteData(stream.data, stream.data.Len())
-		return
-	case "/empty":
-		stream.henc.WriteField(headerField_status200)
-		stream.henc.WriteField(headerField_nocache)
-		stream.data.Reset(nil)
-		stream.WriteData(stream.data, stream.data.Len())
-		return
-	case "/garbage":
 
-		stream.RandOut()
-		return
-	}
 	filename = static_patch + filename
 	var f_cache *file_cache
-	if cache, ok := static_cache.Load(filename); ok {
+	var f_cache_err error
+	if cache, ok := static_cache.Load(filename); ok { //这个cache在http2那边
 		f_cache = cache.(*file_cache)
+
+		//有缓存，检查文件是否修改
+		if !httpIswatcher && f_cache.etag != "" && atomic.CompareAndSwapUint32(&f_cache.check, 0, 1) {
+			f_cache_err, f_cache = f_cache.Check(filename)
+			time.AfterFunc(time.Second, func() { f_cache.check = 0 })
+		}
 	} else {
-		f_cache = &file_cache{}
-	}
-	var f *os.File
-	var fstat os.FileInfo
-	var err error
-	//有缓存，检查文件是否修改
-	if f_cache.etag != "" && atomic.CompareAndSwapUint32(&f_cache.check, 0, 1) {
-		f, err = os.Open(filename)
-		if err != nil {
-			f_cache.etag = ""
-			stream.Out404Frame(err)
+		if httpIswatcher {
+			httpWatcher.Add(filename)
+		}
+		f_cache_err, f_cache = f_cache.Check(filename)
 
-			return
-		}
-		defer f.Close()
-		fstat, err = f.Stat()
-		if err != nil {
-			f_cache.etag = ""
-			stream.Out404Frame(err)
-
-			return
-		}
-		if t := fstat.ModTime().Unix(); t > f_cache.modTime {
-			f_cache.etag = ""
-			f_cache.modTime = t
-		}
-		time.AfterFunc(time.Second, func() { f_cache.check = 0 })
 	}
-	if f_cache.etag != "" {
+
+	if f_cache_err == nil {
 		if f_cache.etag == etag {
 			stream.henc.WriteField(headerField_status304)
 			stream.data.Reset(nil)
-		} else if deflate && len(f_cache.deflatefile) > 0 {
+		} else if deflate && f_cache.iscompress { //deflate压缩资源
 			stream.henc.WriteField(headerField_status200)
 			stream.henc.WriteField(f_cache.content_type_h2)
 			stream.henc.WriteField(headerField_deflate)
 			stream.data.Reset(f_cache.deflatefile)
-		} else {
+		} else if isgzip && f_cache.iscompress { //gzip可压缩资源
+			stream.henc.WriteField(headerField_status200)
+			stream.henc.WriteField(f_cache.content_type_h2)
+			g := gzippool.Get().(*gzip.Writer)
+			defer gzippool.Put(g)
+			stream.compressbuf.Reset()
+			g.Reset(stream.compressbuf)
+			g.Write(f_cache.file)
+			g.Flush()
+			stream.henc.WriteField(headerField_gzip)
+			stream.data.Reset(stream.compressbuf.Bytes())
+
+		} else { //非压缩资源
 			stream.henc.WriteField(headerField_status200)
 			stream.henc.WriteField(f_cache.content_type_h2)
 			stream.data.Reset(f_cache.file)
 		}
 		stream.henc.WriteField(hpack.HeaderField{Name: "etag", Value: f_cache.etag})
 		stream.WriteData(stream.data, stream.data.Len())
-
 		return
+
 	} else {
-		//大文件时速度比较慢，目前的模式是小文件crc etag+缓存模式
-		if f == nil {
-			f, err = os.Open(filename)
-			if err != nil {
-				stream.Out404Frame(err)
-
-				return
-			}
-			defer f.Close()
-			fstat, err = f.Stat()
-			if err != nil {
-				stream.Out404Frame(err)
-
-				return
-			}
-			f_cache.modTime = fstat.ModTime().Unix()
+		f, err := os.Open(filename)
+		if err != nil {
+			stream.Out404Frame(err)
+			return
 		}
-		if fstat.Size() < 1024*1024*5 { //暂定5Mb是大文件
-			b := make([]byte, fstat.Size())
-			n, err := io.ReadFull(f, b)
-			if err != nil || n != int(fstat.Size()) {
-				stream.Out404Frame(err)
-
-				return
-			} else {
-				f_cache.file = make([]byte, len(b))
-				copy(f_cache.file, b)
-				f_cache.etag = strconv.Itoa(int(crc32.ChecksumIEEE(b)))
-				stream.henc.WriteField(headerField_status200)
-				s := strings.Split(filename, ".")
-				name := s[len(s)-1]
-				switch {
-				case strings.Contains(name, "css"):
-					stream.henc.WriteField(headerField_content_type_css)
-					f_cache.content_type_h2 = headerField_content_type_css
-					f_cache.content_type = "text/css"
-				case strings.Contains(name, "html"):
-					stream.henc.WriteField(headerField_content_type_html)
-					f_cache.content_type_h2 = headerField_content_type_html
-					f_cache.content_type = "text/html;charset=utf-8"
-				case strings.Contains(name, "js"):
-					stream.henc.WriteField(headerField_content_type_js)
-					f_cache.content_type_h2 = headerField_content_type_js
-					f_cache.content_type = "application/javascript"
-				case strings.Contains(name, "gif"):
-					isgzip = false
-					deflate = false
-					stream.henc.WriteField(headerField_content_type_gif)
-					f_cache.content_type_h2 = headerField_content_type_gif
-					f_cache.content_type = "image/gif"
-				case strings.Contains(name, "png"):
-					isgzip = false
-					deflate = false
-					stream.henc.WriteField(headerField_content_type_png)
-					f_cache.content_type_h2 = headerField_content_type_png
-					f_cache.content_type = "image/png"
-				default:
-					isgzip = false
-					deflate = false
-					stream.henc.WriteField(headerField_content_type_default)
-					f_cache.content_type_h2 = headerField_content_type_default
-					f_cache.content_type = "application/octet-stream"
-				}
-				if len(b) > 512 && (isgzip || deflate) {
-					switch {
-					case deflate:
-						stream.compressbuf.Reset()
-						w := CompressNoContextTakeover(stream.compressbuf, 6)
-						w.Write(b)
-						w.Close()
-						stream.henc.WriteField(headerField_deflate)
-						f_cache.deflatefile = make([]byte, stream.compressbuf.Len())
-						copy(f_cache.deflatefile, stream.compressbuf.Bytes())
-						stream.data.Reset(stream.compressbuf.Bytes())
-					case isgzip:
-						g := gzippool.Get().(*gzip.Writer)
-						stream.compressbuf.Reset()
-						g.Reset(stream.compressbuf)
-						g.Write(b)
-						g.Flush()
-						stream.henc.WriteField(headerField_gzip)
-						stream.data.Reset(stream.compressbuf.Bytes())
-						gzippool.Put(g)
-					}
-				} else {
-					stream.data.Reset(b)
-				}
-				static_cache.Store(filename, f_cache)
-				stream.henc.WriteField(hpack.HeaderField{Name: "etag", Value: f_cache.etag})
-				stream.henc.WriteField(headerField_cachecontrol)
-				stream.WriteData(stream.data, stream.data.Len())
-
+		defer f.Close()
+		fstat, err := f.Stat()
+		if err != nil {
+			stream.Out404Frame(err)
+			return
+		}
+		f_cache.modTime = fstat.ModTime().Unix()
+		if range_start > 0 || range_end > 0 {
+			stream.henc.WriteField(headerField_status206)
+			if range_end == 0 {
+				range_end = int(fstat.Size())
 			}
+			f.Seek(int64(range_start), 0)
+			stream.henc.WriteField(headerField_content_type_default)
+			stream.henc.WriteField(headerField_Accept_Ranges)
+			stream.henc.WriteField(hpack.HeaderField{Name: "content-range", Value: "bytes " + strconv.Itoa(range_start) + "-" + strconv.Itoa(range_end) + "/" + strconv.Itoa(int(fstat.Size()))})
+			stream.WriteData(f, range_end-range_start)
 		} else {
-
-			if range_start > 0 || range_end > 0 {
-
-				stream.henc.WriteField(headerField_status206)
-				if range_end == 0 {
-					range_end = int(fstat.Size())
-				}
-				f.Seek(int64(range_start), 0)
-				stream.henc.WriteField(headerField_content_type_default)
-				stream.henc.WriteField(headerField_Accept_Ranges)
-				stream.henc.WriteField(hpack.HeaderField{Name: "content-range", Value: "bytes " + strconv.Itoa(range_start) + "-" + strconv.Itoa(range_end) + "/" + strconv.Itoa(int(fstat.Size()))})
-				stream.WriteData(f, range_end-range_start)
-			} else {
-				stream.henc.WriteField(headerField_status200)
-				stream.henc.WriteField(headerField_content_type_default)
-				stream.WriteData(f, int(fstat.Size()))
-			}
-
+			stream.henc.WriteField(headerField_status200)
+			stream.henc.WriteField(headerField_content_type_default)
+			stream.WriteData(f, int(fstat.Size()))
 		}
 
 	}
-
+	return
 }
 
 func (stream *Http2stream) WriteData(reader io.Reader, length int) {
 
 	stream.henc.WriteField(headerField_server)
 	stream.henc.WriteField(headerField_hsts)
-
-	stream.henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(length)})
 	//stream.henc.WriteField(headerField_firefox)
 	stream.writeFrame(reader, length)
 	if stream.close == 3 {
@@ -602,7 +522,7 @@ func (stream *Http2stream) Out404Frame(err error) {
 	stream.data.Reset(http404b)
 	stream.henc.WriteField(headerField_server)
 	stream.henc.WriteField(headerField_hsts)
-	stream.henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(http404b))})
+
 	stream.writeFrame(stream.data, len(http404b))
 	if stream.close == 3 {
 		stream.svr.Streams[stream.Id] = nil
@@ -610,6 +530,17 @@ func (stream *Http2stream) Out404Frame(err error) {
 	}
 }
 func (stream *Http2stream) writeFrame(reader io.Reader, msglen int) (err error) {
+	for k, v := range stream.OutHeader {
+		stream.henc.WriteField(hpack.HeaderField{Name: k, Value: url.QueryEscape(v)})
+	}
+	stream.henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(msglen)})
+	for name, v := range stream.OutCookie {
+		cookie := url.QueryEscape(name) + "=" + url.QueryEscape(v.value)
+		if v.max_age > 0 {
+			cookie += "; Max-age=" + strconv.FormatUint(uint64(v.max_age), 10) + "; Path=/"
+		}
+		stream.henc.WriteField(hpack.HeaderField{Name: "set-cookie", Value: cookie})
+	}
 
 	makelen := stream.headerbuf.Len()
 	stream.Out.Reset()
@@ -632,8 +563,9 @@ func (stream *Http2stream) writeFrame(reader io.Reader, msglen int) (err error) 
 		stream.Out.Reset()
 
 	}
-	for olen := stream.Out.Len(); msglen > 0; olen = stream.Out.Len() {
 
+
+	for olen := stream.Out.Len(); msglen > 0; olen = stream.Out.Len() {
 		makelen = stream.svr.Setting.MAX_FRAME_SIZE - olen
 		outbuf := stream.Out.Make(http2headerlength + makelen)
 		n, err := reader.Read(outbuf[http2headerlength:])
@@ -643,40 +575,50 @@ func (stream *Http2stream) writeFrame(reader io.Reader, msglen int) (err error) 
 			return err
 		}
 		//总的流量窗口
-		stream_windows_size := atomic.LoadInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE)
-		if stream_windows_size <= 0 {
-
-			select {
-			case flag := <-stream.svr.Streams[0].sendch: //等待放行
-				if flag == http2streamflagclose {
-					return nil
-				}
-
-			}
-			stream_windows_size = atomic.AddInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE, int32(-1*n))
-			if stream_windows_size > 0 {
+		if atomic.LoadInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE) <= 0 {
+			for atomic.LoadInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE) <= 0 {
+				//fmt.Println(stream.Id,"卡住",stream.svr.Streams[0].OUT_WINDOW_SIZE)
 				select {
-				case stream.svr.Streams[0].sendch <- http2streamflagadd:
-				default:
+				case flag := <-stream.svr.Streams[0].sendch: //等待放行
+					if flag == http2streamflagclose {
+						return err
+					}
+				case flag := <-stream.sendch: //通知关闭
+					if flag == http2streamflagclose {
+						return err
+					}
+				case <-time.After(time.Millisecond * 10):
 				}
 			}
+
+			value := atomic.AddInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE, int32(-1*n))
+			if value > 0 { // 尝试对其他阻塞的window解锁
+				stream.svr.ReadPool.Submit(func() {
+					select {
+					case stream.svr.Streams[0].sendch <- http2streamflagadd:
+					case <-time.After(time.Millisecond * 10):
+					}
+				})
+			}
+
 		} else {
 			atomic.AddInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE, int32(-1*n))
 		}
-		stream_windows_size = atomic.LoadInt32(&stream.OUT_WINDOW_SIZE)
-		if stream_windows_size <= 0 {
-			select {
-			case flag := <-stream.sendch: //等待放行
-				if flag == http2streamflagclose {
-					return nil
+		if atomic.LoadInt32(&stream.OUT_WINDOW_SIZE) <= 0 {
+			for atomic.LoadInt32(&stream.OUT_WINDOW_SIZE) <= 0 {
+				select {
+				case flag := <-stream.sendch: //等待放行
+					if flag == http2streamflagclose {
+						return err
+					}
+				case <-time.After(time.Millisecond * 10):
 				}
-
 			}
+		} else {
+			atomic.AddInt32(&stream.OUT_WINDOW_SIZE, int32(-1*n))
 		}
 
 		msglen -= n
-		atomic.AddInt32(&stream.OUT_WINDOW_SIZE, int32(-1*n))
-
 		outbuf[0] = byte(n >> 16)
 		outbuf[1] = byte(n >> 8)
 		outbuf[2] = byte(n)
@@ -693,7 +635,9 @@ func (stream *Http2stream) writeFrame(reader io.Reader, msglen int) (err error) 
 		}
 		stream.svr.c.AsyncWrite(stream.Out.Next(olen + http2headerlength + n))
 		stream.Out.Reset()
+
 	}
+
 
 	return nil
 }
@@ -766,104 +710,302 @@ func (errcode http2writeRST_STREAM) writeFrame(stream *Http2stream) (err error) 
 	stream.svr.c.AsyncWrite(outbuf)
 	return nil
 }
-func (stream *Http2stream) RandOut() {
-	f, err := os.Open(static_patch + "/tmp")
+
+var (
+	httpIswatcher bool
+	httpWatcher   *fsnotify.Watcher
+	static_cache  sync.Map
+	static_patch  string
+)
+
+func init() {
+	dir, _ := os.Getwd()
+	static_patch = strings.ReplaceAll(dir, `\`, "/") + "/static"
+	var err error
+	httpWatcher, err = fsnotify.NewWatcher()
+	httpIswatcher = err == nil
+	go func() {
+		for httpIswatcher {
+			select {
+			case event := <-httpWatcher.Events:
+
+				filename := strings.ReplaceAll(event.Name, `\`, "/")
+				cache, ok := static_cache.Load(filename)
+				if ok {
+					err, _ := cache.(*file_cache).Check(filename)
+					if err == file_cache_err_NotFound {
+						static_cache.Delete(filename)
+					}
+				}
+			case err := <-httpWatcher.Errors:
+				DebugLog("error:%v", err)
+			}
+		}
+	}()
+}
+
+var (
+	file_cache_err_NotFound  = errors.New("file not found")
+	file_cache_file_TooLarge = errors.New("file too large")
+)
+
+const file_cache_limit = 1024 * 1024 * 5 //暂定5Mb是大文件
+func (cache *file_cache) Check(filename string) (error, *file_cache) {
+	f_cache := new(file_cache)
+	f, err := os.OpenFile(filename, os.O_RDONLY, 0555)
 	if err != nil {
-		stream.Out404Frame(err)
-		return
+		return file_cache_err_NotFound, cache
 	}
 	defer f.Close()
-	f_info, err := f.Stat()
+	fstat, err := f.Stat()
 	if err != nil {
-		stream.Out404Frame(err)
-		return
+		return err, cache
 	}
-	randlen := 1024*1024*20 + rand.Intn(1024*1024*40) //生成的随机长度，10+10MB
-	stream.henc.WriteField(headerField_status200)
-	stream.henc.WriteField(headerField_nocache)
-	stream.henc.WriteField(hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(randlen)})
-	//stream.henc.WriteField(headerField_firefox)
-	makelen := stream.headerbuf.Len()
-	stream.Out.Reset()
-	buf := stream.Out.Make(http2headerlength + makelen)
-	buf[0] = byte(makelen >> 16)
-	buf[1] = byte(makelen >> 8)
-	buf[2] = byte(makelen)
-	buf[3] = http2FrameHeaders
-	buf[4] = http2FlagHeadersEndHeaders
-	buf[5] = byte(stream.Id >> 24)
-	buf[6] = byte(stream.Id >> 16)
-	buf[7] = byte(stream.Id >> 8)
-	buf[8] = byte(stream.Id)
-	copy(buf[http2headerlength:], stream.headerbuf.Bytes())
+	if t := fstat.ModTime().Unix(); cache != nil && t == cache.modTime {
+		return nil, cache
+	} else {
+		f_cache.modTime = t
+	}
+	if fstat.Size() == 0 {
+		return nil, cache
+	} else if fstat.Size() > file_cache_limit {
+		return file_cache_file_TooLarge, cache
+	}
+	f_cache.file = make([]byte, fstat.Size())
+	_, err = io.ReadFull(f, f_cache.file)
+	if err != nil {
+		return err, cache
+	}
+	f_cache.etag = strconv.Itoa(int(crc32.ChecksumIEEE(f_cache.file)))
+	f_cache.iscompress = true
+	s := strings.Split(filename, ".")
+	name := s[len(s)-1]
+	switch {
+	case strings.Contains(name, "css"):
+		f_cache.content_type_h2 = headerField_content_type_css
+		f_cache.content_type = "text/css"
+	case strings.Contains(name, "html"):
+		f_cache.content_type_h2 = headerField_content_type_html
+		f_cache.content_type = "text/html;charset=utf-8"
+	case strings.Contains(name, "js"):
+		f_cache.content_type_h2 = headerField_content_type_js
+		f_cache.content_type = "application/javascript"
+	case strings.Contains(name, "gif"):
+		f_cache.iscompress = false
+		f_cache.content_type_h2 = headerField_content_type_gif
+		f_cache.content_type = "image/gif"
+	case strings.Contains(name, "png"):
+		f_cache.iscompress = false
+		f_cache.content_type_h2 = headerField_content_type_png
+		f_cache.content_type = "image/png"
+	default:
+		f_cache.iscompress = false
+		f_cache.content_type_h2 = headerField_content_type_default
+		f_cache.content_type = "application/octet-stream"
+	}
+	if f_cache.iscompress {
+		buf := &tls.MsgBuffer{}
+		buf.Reset()
+		w := CompressNoContextTakeover(buf, 6)
+		w.Write(f_cache.file)
+		w.Close()
+		f_cache.deflatefile = make([]byte, buf.Len())
+		copy(f_cache.deflatefile, buf.Bytes())
+	}
+	static_cache.Store(filename, f_cache)
+	return nil, f_cache
+}
+func (stream *Http2stream) AddQuery(key, value string) {
+	stream.query[key] = append(stream.query[key], value)
+}
+func (stream *Http2stream) Body() []byte {
+	return stream.In.Bytes()
+}
+func (stream *Http2stream) Close() {
+	stream.svr.Close()
+}
+func (stream *Http2stream) Cookie(key string) string {
 
-	for msglen, olen := randlen, stream.Out.Len(); randlen > 0; msglen, olen = randlen, stream.Out.Len() {
-		if msglen > http2initialMaxFrameSize-olen-http2headerlength { //切分为一个tls包
-			msglen = http2initialMaxFrameSize - olen - http2headerlength
+	return stream.cookie[key]
+}
+func (stream *Http2stream) DelSession() {
+	if stream.session != nil {
+		stream.session.Hdel()
+	}
+}
+func (stream *Http2stream) GetAllPost() map[string][]string {
+	return nil
+}
+func (stream *Http2stream) GetAllQuery() map[string][]string {
+	return stream.query
+}
+func (stream *Http2stream) Header(name string) string {
+	for _, head := range stream.Headers {
+		if head.Name == name {
+			return head.Value
+		} else if head.Name == strings.ToLower(name) {
+			return head.Value
 		}
-		outbuf := stream.Out.Make(http2headerlength + msglen)
-		//设置随机起点
-		f.Seek(rand.Int63n(f_info.Size()-int64(msglen)), 0)
-		//读取一段长度
-		n, err := f.Read(outbuf[http2headerlength:])
 
-		if err != nil || n <= 0 {
-			http2writeRST_STREAM(http2ErrCodeInternal).writeFrame(stream)
+	}
+	return ""
+}
+func (stream *Http2stream) IP() (ip string) {
+
+	if ip = stream.Header("X-Real-IP"); ip == "" {
+		ip = stream.svr.c.RemoteAddr().String()
+	}
+	re3, _ := regexp.Compile(`:\d+$`)
+	ip = re3.ReplaceAllString(ip, "")
+	return ip
+}
+func (stream *Http2stream) Method() string {
+	return stream.method
+}
+func (stream *Http2stream) Path() string {
+	return stream.path
+}
+func (stream *Http2stream) Post(key string) string {
+	if len(stream.post[key]) > 0 {
+		return stream.post[key][0]
+	}
+	return ""
+}
+func (stream *Http2stream) PostSlice(key string) []string {
+	return stream.post[key]
+}
+func (stream *Http2stream) Query(key string) string {
+	if len(stream.query[key]) > 0 {
+		return stream.query[key][0]
+	}
+	return ""
+}
+func (stream *Http2stream) RangeDownload(b HttpIoReader, size int64, name string) {
+	var range_start, range_end int
+	for _, head := range stream.Headers {
+		switch head.Name {
+		case "range":
+			if strings.Index(head.Value, "bytes=") == 0 {
+
+				if e := strings.Index(head.Value, "-"); e > 6 {
+					range_start, _ = strconv.Atoi(head.Value[6:e])
+					range_end, _ = strconv.Atoi(head.Value[e+1:])
+				}
+
+			}
+		}
+	}
+	if range_start > 0 || range_end > 0 {
+		stream.henc.WriteField(headerField_status206)
+		if range_end == 0 {
+			range_end = int(size)
+		}
+		if _, e := b.Seek(int64(range_start), 0); e != nil {
+			stream.OutErr(e)
 			return
 		}
-		//总的流量窗口
-		stream_windows_size := atomic.LoadInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE)
-		if stream_windows_size <= 0 {
+		stream.henc.WriteField(headerField_Accept_Ranges)
+		stream.henc.WriteField(hpack.HeaderField{Name: "content-range", Value: "bytes " + strconv.Itoa(range_start) + "-" + strconv.Itoa(range_end) + "/" + strconv.Itoa(int(size))})
+		stream.henc.WriteField(hpack.HeaderField{Name: "content-disposition", Value: `attachment; filename*="utf8''` + url.QueryEscape(name) + `"`})
+		stream.WriteData(b, range_end-range_start)
 
-			select {
-			case flag := <-stream.svr.Streams[0].sendch: //等待放行
-				if flag == http2streamflagclose {
-					return
-				}
-
-			}
-			stream_windows_size = atomic.AddInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE, int32(-1*n))
-			if stream_windows_size > 0 {
-				select {
-				case stream.svr.Streams[0].sendch <- http2streamflagadd:
-				default:
-				}
-			}
-		} else {
-			atomic.AddInt32(&stream.svr.Streams[0].OUT_WINDOW_SIZE, int32(-1*n))
-		}
-		stream_windows_size = atomic.LoadInt32(&stream.OUT_WINDOW_SIZE)
-		if stream_windows_size <= 0 {
-			select {
-			case flag := <-stream.sendch: //等待放行
-				if flag == http2streamflagclose {
-					return
-				}
-
-			}
-		}
-		randlen -= n
-		atomic.AddInt32(&stream.OUT_WINDOW_SIZE, int32(-1*n))
-
-		outbuf[0] = byte(n >> 16)
-		outbuf[1] = byte(n >> 8)
-		outbuf[2] = byte(n)
-		outbuf[3] = http2FrameData
-		outbuf[4] = 0
-		outbuf[5] = byte(stream.Id >> 24)
-		outbuf[6] = byte(stream.Id >> 16)
-		outbuf[7] = byte(stream.Id >> 8)
-		outbuf[8] = byte(stream.Id)
-
-		if randlen == 0 {
-			outbuf[4] = http2FlagDataEndStream
-			stream.close |= 2
-		}
-		stream.svr.c.AsyncWrite(stream.Out.Next(olen + http2headerlength + n))
-		stream.Out.Reset()
-
+	} else {
+		stream.henc.WriteField(headerField_status200)
+		stream.henc.WriteField(headerField_content_type_default)
+		stream.henc.WriteField(hpack.HeaderField{Name: "content-disposition", Value: `attachment; filename*="utf8''` + url.QueryEscape(name) + `"`})
+		stream.WriteData(b, int(size))
 	}
 
-	stream.svr.Streams[stream.Id] = nil
-	stream_pool.Put(stream)
+	return
+}
+func (stream *Http2stream) OutErr(err error) {
+	if Errfunc != nil {
+		if Errfunc(stream, err) {
+			return
+		}
+	}
+	buf := &tls.MsgBuffer{}
+	buf.WriteString(err.Error())
+	stream.henc.WriteField(headerField_status500)
+
+	stream.writeFrame(buf, buf.Len())
+}
+func (stream *Http2stream) Redirect(url string) {
+
+	stream.henc.WriteField(headerField_status302)
+	stream.henc.WriteField(hpack.HeaderField{Name: "location", Value: url})
+	stream.writeFrame(nil, 0)
+}
+func (stream *Http2stream) RemoteAddr() string {
+	return stream.svr.c.RemoteAddr().String()
+}
+func (stream *Http2stream) Session() *cache.Hashvalue {
+	if stream.session == nil {
+		//检查sessionID
+		var has bool
+		sessionIdKey := stream.Cookie("sessionID")
+		if sessionIdKey != "" {
+			stream.session, has = cache.Has(sessionIdKey, "session")
+		}
+		//不存在则创建一个
+		if !has {
+			has = true
+			//循环检查到一个没用过的sessionIdKey
+			for has {
+				b := make([]byte, 8)
+				binary.LittleEndian.PutUint64(b, atomic.AddUint64(&sessionID, 1))
+				sha := sha256.Sum256(Str2bytes(strconv.FormatInt(time.Now().UnixNano(), 10) + string(b)))
+				sessionIdKey = strings.TrimRight(base64.URLEncoding.EncodeToString(sha[:]), "=")
+				_, has = cache.Has(sessionIdKey, "session")
+			}
+			stream.SetCookie("sessionID", sessionIdKey, 7*86400)
+			stream.session = cache.Hget(sessionIdKey, "session")
+			stream.session.Set("sessionID", sessionIdKey)
+			stream.session.Expire(8 * 3600) //给个临时session
+		}
+	}
+	return stream.session
+}
+func (stream *Http2stream) SetCookie(name, value string, max_age uint32) {
+	stream.OutCookie[name] = httpcookie{
+		value:   value,
+		max_age: max_age,
+	}
+}
+func (stream *Http2stream) SetCode(code int) {
+	stream.outCode = code
+}
+func (stream *Http2stream) SetContentType(t string) {
+	stream.OutContentType = t
+}
+func (stream *Http2stream) SetHeader(key, value string) {
+	stream.OutHeader[key] = value
+}
+func (stream *Http2stream) URI() string {
+	return stream.uri
+}
+func (stream *Http2stream) Referer() string {
+	return stream.referer
+}
+func (stream *Http2stream) Write(b []byte) {
+
+	if stream.outCode != 0 && httpCode(stream.outCode).Bytes() != nil {
+		stream.henc.WriteField(hpack.HeaderField{Name: ":status", Value: strconv.Itoa(stream.outCode)})
+	} else {
+		stream.henc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	}
+	stream.henc.WriteField(headerField_nocache)
+	if stream.OutContentType != "" {
+		stream.henc.WriteField(hpack.HeaderField{Name: "content-type", Value: stream.OutContentType})
+	} else {
+		stream.henc.WriteField(headerField_content_type_html)
+
+	}
+	stream.Out2.Reset()
+	stream.Out2.Write(b)
+	stream.writeFrame(stream.Out2, stream.Out2.Len())
+}
+
+func (stream *Http2stream) WriteString(str string) {
+	stream.Write(Str2bytes(str))
 }

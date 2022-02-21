@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"server/codec"
 	"server/config"
 	"sort"
@@ -34,6 +35,7 @@ const (
 	CLIENT_SSL               = 0x00000800
 	CLIENT_PROTOCOL_41       = 0x00000200
 	CLIENT_SECURE_CONNECTION = 0x00008000 //1
+	writeDeadline            = time.Second * 5
 )
 const (
 	cmd_none        = iota
@@ -85,22 +87,18 @@ var (
 type f翻墙 struct {
 	*gnet.EventServer
 	addr      string
-	pool      *ants.Pool
 	mysqladdr string
 	server    sync.Map
 }
 type mainServer struct {
 	*gnet.EventServer
 	addr string
-	pool *ants.Pool
 }
 type client struct {
 	fd_m   sync.Map
 	key    string
 	conn_m map[string]gnet.Conn
 }
-
-var gopool, _ = ants.NewPool(1024, ants.WithPreAlloc(true))
 
 type fdsort []*Conn
 
@@ -114,7 +112,7 @@ func (s fdsort) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 func main() {
-	f := &f翻墙{addr: config.Server.Listen, pool: gopool}
+	f := &f翻墙{addr: config.Server.Listen}
 	http.HandleFunc("/fd", func(w http.ResponseWriter, r *http.Request) {
 		str := []string{}
 		client_m.Range(func(k, c interface{}) bool {
@@ -162,10 +160,10 @@ func main() {
 	go func() {
 
 		codec := &codec.Tlscodec{}
-		h := &mainServer{addr: "tcp://:808", pool: gopool}
+		h := &mainServer{addr: "tcp://:808"}
 		go gnet.Serve(h, h.addr, gnet.WithLoopNum(4), gnet.WithReusePort(false), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(32), gnet.WithMultiOut(false))
-		return
-		h443 := &mainServer{addr: "tcp://:443", pool: gopool}
+
+		h443 := &mainServer{addr: "tcp://:443"}
 		gnet.Serve(h443, h443.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(codec), gnet.WithOutbuf(64), gnet.WithMultiOut(false), gnet.WithTls(&tls.Config{
 			Certificates:             []tls.Certificate{cert},
 			RootCAs:                  certPool,
@@ -184,8 +182,6 @@ func main() {
 			MinVersion: tls.VersionTLS12,
 		}))
 	}()
-
-	defer f.pool.Release()
 
 	codec := &CodecMysql{
 		server: f,
@@ -356,7 +352,6 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		}
 		port := binary.BigEndian.Uint16(data[len(data)-2:])
 		addr := string(data[headlen:len(data)-2]) + ":" + strconv.Itoa(int(port))
-
 		conn := &Conn{}
 		conn.ctx = ctx
 		conn.address = addr
@@ -390,7 +385,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 				return
 			}
 			netconn, err := net.DialTCP("tcp", lAddr, rAddr)*/
-			netconn, err := net.Dial("tcp", addr)
+			netconn, err := net.DialTimeout("tcp", addr, time.Second*30)
 			if err != nil {
 				conn.Close("fd拨号失败")
 				conn.write = make(chan *tls.MsgBuffer, 1000000)
@@ -428,7 +423,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 			return
 		}
 		conn := v.(*Conn)
-		windows_update_size := int64(data[3]) | int64(data[4])<<8 | int64(data[5])<<16 | int64(data[6])<<24 | int64(data[7])<<32 | int64(data[8])<<40 | int64(data[9])<<48 | int64(data[10])<<54
+		windows_update_size := int64(data[3]) | int64(data[4])<<8 | int64(data[5])<<16 | int64(data[6])<<24 | int64(data[7])<<32 | int64(data[8])<<40 | int64(data[9])<<48 | int64(data[10])<<56
 
 		if windows_update_size != 0 {
 
@@ -445,7 +440,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		b := buf_pool.Get().(*tls.MsgBuffer)
 		b.Reset()
 		b.Write(data[headlen+8:])
-		conn.write <- b
+		antspool.Submit(func() { conn.write <- b })
 
 	case cmd_deletefd:
 		if ctx.client == nil {
@@ -463,7 +458,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		v, ok := ctx.client.fd_m.Load([2]byte{data[1], data[2]})
 		if ok {
 			conn := v.(*Conn)
-			windows_update_size := int64(data[3]) | int64(data[4])<<8 | int64(data[5])<<16 | int64(data[6])<<24 | int64(data[7])<<32 | int64(data[8])<<40 | int64(data[9])<<48 | int64(data[10])<<54
+			windows_update_size := int64(data[3]) | int64(data[4])<<8 | int64(data[5])<<16 | int64(data[6])<<24 | int64(data[7])<<32 | int64(data[8])<<40 | int64(data[9])<<48 | int64(data[10])<<56
 			if windows_update_size > 0 {
 				old := atomic.AddInt64(&conn.windows_size, windows_update_size) - windows_update_size
 				if old < 0 {
@@ -517,28 +512,12 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 	return
 }
 
-func init() {
-	/*if len(aesiv) < 16 {
-		aesiv = append(aesiv, make([]byte, 16-len(aesiv))...)
-	} else {
-		aesiv = aesiv[:16]
-	}
-	if len(aeskey) < 16 {
-		aeskey = append(aeskey, make([]byte, 16-len(aeskey))...)
-	} else {
-		aeskey = aeskey[:16]
-	}*/
-	rand.Seed(time.Now().UnixNano())
-	//aesblock, _ = aes.NewCipher(aeskey)
-
-}
-
-var antspool, _ = ants.NewPool(10240)
+var antspool, _ = ants.NewPool(102400)
 
 func (conn *Conn) Close(reason string) {
 
 	if atomic.CompareAndSwapInt32(&conn.close, 0, 1) {
-		conn.ctx.server.pool.Submit(func() {
+		antspool.Submit(func() {
 			if conn.conn != nil {
 				conn.conn.Close()
 			}
@@ -592,8 +571,9 @@ var handsocks, _ = ants.NewPoolWithFunc(65535, func(i interface{}) {
 	buf[2] = conn.fd[1]
 
 	for conn.close == 0 {
+		conn.conn.SetReadDeadline(time.Now().Add(writeDeadline))
 		n, err = conn.conn.Read(buf[headlen:])
-		if err != nil || n < 1 {
+		if err != nil {
 			if atomic.LoadInt32(&conn.close) == 0 {
 				if e := err.Error(); !strings.Contains(e, ": i/o timeout") {
 
@@ -757,12 +737,10 @@ func (hs *mainServer) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 	switch svr := c.Context().(type) {
 
 	case *codec.Httpserver:
-		svr.Request.Connection = ""
-
-		codec.Httppool.Put(svr)
+		svr.Close()
 
 	case *codec.Http2server:
-		hs.pool.Submit(func() {
+		antspool.Submit(func() {
 			svr.Close()
 		})
 	}
@@ -770,39 +748,97 @@ func (hs *mainServer) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
 	return
 }
 
-var hello = []byte("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello word!")
-
 func (hs *mainServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 
 	switch svr := c.Context().(type) {
 	case *codec.Httpserver:
-		switch svr.Request.Path {
-		case "/hello":
-			c.AsyncWrite(hello)
-			return
-		case "/getIP":
-			buf := buf_pool.Get().(*tls.MsgBuffer)
-			buf.Reset()
-			buf.WriteString(`{"processedString":"` + c.RemoteAddr().String() + `"}`)
-			svr.Output_data(buf.Bytes())
-			buf_pool.Put(buf)
-		case "/empty":
-			svr.Output_data(nil)
-		case "/garbage":
-			svr.RandOut()
-			return
-		default:
-			svr.Static()
-		}
-		if svr.Request.Connection == "close" {
-			action = gnet.Close
+		if data == nil {
+			svr.Wake()
+		} else {
+			req := svr.GetWorkRequest()
+			antspool.Submit(func() {
+
+				switch req.Path() {
+				case "/hello":
+					req.WriteString("hello word!")
+				case "/getIP":
+					buf := buf_pool.Get().(*tls.MsgBuffer)
+					buf.Reset()
+					buf.WriteString(`{"processedString":"` + c.RemoteAddr().String() + `"}`)
+					req.Write(buf.Bytes())
+					buf_pool.Put(buf)
+				case "/empty":
+					req.Write(nil)
+				case "/garbage":
+					req.WriteNoCompress(<-randDataChan)
+				default:
+					req.StaticHandler()
+				}
+				req.Wake()
+			})
+
 		}
 
 		return gnet.None
 
 	case *codec.Http2server:
-		svr.SendPool.Invoke(svr.WorkStream) //h2是异步，可能会Jitter抖动厉害
+		req := svr.WorkStream
+		antspool.Submit(func() {
+			switch req.Path() {
+			case "/hello":
+				req.WriteString("hello word!")
+			case "/getIP":
+				buf := buf_pool.Get().(*tls.MsgBuffer)
+				buf.Reset()
+				buf.WriteString(`{"processedString":"` + c.RemoteAddr().String() + `"}`)
+				req.Write(buf.Bytes())
+				buf_pool.Put(buf)
+			case "/empty":
+				req.Write(nil)
+			case "/garbage":
+				req.Write(<-randDataChan)
+			default:
+				req.StaticHandler()
+			}
+		})
 		return
 	}
 	return
+}
+
+var randDataChan = make(chan []byte, 2)
+
+func init() {
+
+	rand.Seed(time.Now().UnixNano())
+	f, err := os.Open("./static/tmp")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	f_info, err := f.Stat()
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		for {
+			randlen := 1024*1024*10 + rand.Intn(1024*1024*10)
+			b := make([]byte, randlen)
+			start := 0
+			for msglen := randlen; randlen > 0; msglen = randlen {
+				if msglen > int(f_info.Size()/2) { //切分为一个tls包
+					msglen = int(f_info.Size() / 2)
+				}
+				//设置随机起点
+				f.Seek(rand.Int63n(f_info.Size()-int64(msglen)), 0)
+				//读取一段长度
+				n, _ := f.Read(b[start : start+msglen])
+				start += n
+				randlen -= msglen
+			}
+			randDataChan <- b
+		}
+
+	}()
+
 }

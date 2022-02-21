@@ -9,7 +9,6 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"sort"
 	"strings"
 
 	"net/http"
@@ -95,7 +94,7 @@ type ServerConn struct {
 	inboundBuffer, outboundBuffer *tls.MsgBuffer
 	buf                           []byte
 	outbufchan, outChan           chan *serverOutBuf
-	inbufchan, inChan             chan *tls.MsgBuffer
+	inChan                        chan []byte
 	regChan                       chan bool
 	addr                          *addr
 	pingtime, pongtime, rectime   int64
@@ -175,62 +174,9 @@ func main() {
 		panic("无法获取网卡mac")
 	}
 	networkMac += strconv.Itoa(rand.Int())
-	hs := &httpServer{addr: "tcp://0.0.0.0:10808"}
+	hs := &httpServer{addr: "tcp://0.0.0.0:10800"}
 	go func() {
-		http.HandleFunc("/fd", func(w http.ResponseWriter, r *http.Request) {
-			str := []string{}
-			var s fdsort
-			fd_m.Range(func(k, v interface{}) bool {
 
-				s = append(s, v.(*Conn))
-				return true
-			})
-			sort.Sort(s)
-			for _, conn := range s {
-				if conn.close != "" {
-					str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+conn.close)
-				} else {
-					str = append(str, "fd"+fmt.Sprint(uint16(conn.fd[0])+uint16(conn.fd[1])<<8)+" "+strconv.Itoa(int(conn.windows_size)))
-				}
-
-			}
-			w.Write([]byte(strings.Join(str, "\r\n")))
-		})
-		http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
-			vars := r.URL.Query()
-			if ids, ok := vars["id"]; ok {
-				id, err := strconv.Atoi(ids[0])
-				if err != nil {
-					w.Write([]byte("id错误"))
-					return
-				}
-				var fd [2]byte
-				fd[0] = byte(id)
-				fd[1] = byte(id >> 8)
-				if v, ok := fd_m.Load(fd); ok {
-					conn := v.(*Conn)
-					b := <-conn.server.outbufchan
-					b.c = conn
-					buf := b.buf.Make(headlen)
-					buf[0] = cmd_msg
-					buf[1] = conn.fd[0]
-					buf[2] = conn.fd[1]
-					conn.server.outChan <- b
-				} else {
-					w.Write([]byte("id不存在"))
-				}
-			} else {
-				w.Write([]byte("缺少参数"))
-			}
-		})
-		http.HandleFunc("/re", func(w http.ResponseWriter, r *http.Request) {
-
-			for _, server := range hs.netchan {
-				server.conn.Close()
-			}
-
-			w.Write([]byte("ok"))
-		})
 		err := http.ListenAndServe("0.0.0.0:8081", nil)
 		if err != nil {
 			http.ListenAndServe("0.0.0.0:8082", nil)
@@ -251,7 +197,7 @@ func main() {
 
 	}
 
-	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64), gnet.WithTicker(true), gnet.WithMultiOut(true))
+	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64), gnet.WithTicker(true), gnet.WithTCPNoDelay(true))
 }
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	fmt.Println("listen", hs.addr, srv.NumEventLoop)
@@ -275,14 +221,14 @@ func (hs *httpServer) Tick() (delay time.Duration, action gnet.Action) {
 		buf[0] = cmd_windowsupdate
 		buf[1] = conn.fd[0]
 		buf[2] = conn.fd[1]
-		buf[3] = byte(size & 255)
-		buf[4] = byte(size >> 8 & 255)
-		buf[5] = byte(size >> 16 & 255)
-		buf[6] = byte(size >> 24 & 255)
-		buf[7] = byte(size >> 32 & 255)
-		buf[8] = byte(size >> 40 & 255)
-		buf[9] = byte(size >> 48 & 255)
-		buf[10] = byte(size >> 54 & 255)
+		buf[3] = byte(size)
+		buf[4] = byte(size >> 8)
+		buf[5] = byte(size >> 16)
+		buf[6] = byte(size >> 24)
+		buf[7] = byte(size >> 32)
+		buf[8] = byte(size >> 40)
+		buf[9] = byte(size >> 48)
+		buf[10] = byte(size >> 56)
 		conn.server.outChan <- b
 
 		return true
@@ -408,14 +354,14 @@ func (hs *httpServer) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		} else {
 			new_size = 0
 		}
-		buf[3] = byte(new_size & 255)
-		buf[4] = byte(new_size >> 8 & 255)
-		buf[5] = byte(new_size >> 16 & 255)
-		buf[6] = byte(new_size >> 24 & 255)
-		buf[7] = byte(new_size >> 32 & 255)
-		buf[8] = byte(new_size >> 40 & 255)
-		buf[9] = byte(new_size >> 48 & 255)
-		buf[10] = byte(new_size >> 54 & 255)
+		buf[3] = byte(new_size)
+		buf[4] = byte(new_size >> 8)
+		buf[5] = byte(new_size >> 16)
+		buf[6] = byte(new_size >> 24)
+		buf[7] = byte(new_size >> 32)
+		buf[8] = byte(new_size >> 40)
+		buf[9] = byte(new_size >> 48)
+		buf[10] = byte(new_size >> 56)
 		copy(buf[headlen+8:], data) //消息内容
 		conn.server.outChan <- b
 	}
@@ -456,7 +402,9 @@ func (server *ServerConn) handleMessage() (err error) {
 		fmt.Println("exit", err)
 
 	}()
-
+	buf1 := make([]byte, maxPlaintext)
+	buf2 := make([]byte, maxPlaintext)
+	m := uint8(0)
 	for {
 		server.conn.SetReadDeadline(time.Now().Add(writeDeadline))
 		n, err := server.conn.Read(server.buf)
@@ -468,12 +416,16 @@ func (server *ServerConn) handleMessage() (err error) {
 		}
 		server.tlsconn.RawWrite(server.buf[:n])
 		for err = server.tlsconn.ReadFrame(); err == nil && server.inboundBuffer.Len() > 0; err = server.tlsconn.ReadFrame() {
-			in := <-server.inbufchan
-			in.Write(server.inboundBuffer.Bytes())
+			m++
+			if m%2 == 1 {
+				copy(buf1, server.inboundBuffer.Bytes())
+				server.inChan <- buf1[:server.inboundBuffer.Len()]
+			} else {
+				copy(buf2, server.inboundBuffer.Bytes())
+				server.inChan <- buf2[:server.inboundBuffer.Len()]
+			}
 			server.inboundBuffer.Reset()
 			server.rectime = time.Now().Unix()
-			server.inChan <- in
-
 		}
 		if err != nil && err != io.EOF {
 			return err
@@ -533,26 +485,28 @@ func (server *ServerConn) do(msg []byte) {
 		if windows_size < windows_update_size/2 { //扩大窗口
 			if size := windows_update_size - conn.windows_size; size > 0 {
 				atomic.AddInt64(&conn.windows_size, size)
-				b := <-server.outbufchan
-				buf := b.buf.Make(11)
-				b.c = nil
-				buf[0] = cmd_windowsupdate
-				buf[1] = conn.fd[0]
-				buf[2] = conn.fd[1]
-				buf[3] = byte(size & 255)
-				buf[4] = byte(size >> 8 & 255)
-				buf[5] = byte(size >> 16 & 255)
-				buf[6] = byte(size >> 24 & 255)
-				buf[7] = byte(size >> 32 & 255)
-				buf[8] = byte(size >> 40 & 255)
-				buf[9] = byte(size >> 48 & 255)
-				buf[10] = byte(size >> 54 & 255)
-				server.outChan <- b
+				go func() {
+					b := <-server.outbufchan
+					buf := b.buf.Make(11)
+					b.c = nil
+					buf[0] = cmd_windowsupdate
+					buf[1] = conn.fd[0]
+					buf[2] = conn.fd[1]
+					buf[3] = byte(size & 255)
+					buf[4] = byte(size >> 8 & 255)
+					buf[5] = byte(size >> 16 & 255)
+					buf[6] = byte(size >> 24 & 255)
+					buf[7] = byte(size >> 32 & 255)
+					buf[8] = byte(size >> 40 & 255)
+					buf[9] = byte(size >> 48 & 255)
+					buf[10] = byte(size >> 56 & 255)
+					server.outChan <- b
+				}()
 			}
 		}
 
 	case cmd_pong:
-		pingtime := int64(msg[1]) | int64(msg[2])<<8 | int64(msg[3])<<16 | int64(msg[4])<<24 | int64(msg[5])<<32 | int64(msg[6])<<40 | int64(msg[7])<<48 | int64(msg[8])<<54
+		pingtime := int64(msg[1]) | int64(msg[2])<<8 | int64(msg[3])<<16 | int64(msg[4])<<24 | int64(msg[5])<<32 | int64(msg[6])<<40 | int64(msg[7])<<48 | int64(msg[8])<<56
 
 		if pingtime != server.pingtime {
 			return
@@ -619,7 +573,8 @@ func (server *ServerConn) reg() error {
 	}
 	server.inboundBuffer.Reset()
 	server.conn.SetReadDeadline(time.Now().Add(writeDeadline))
-	n, err := server.conn.Read(server.inboundBuffer.Make(1024))
+	buf := make([]byte, 2048)
+	n, err := server.conn.Read(buf)
 	if err != nil {
 		log.Println("这里4", err)
 		return err
@@ -627,19 +582,20 @@ func (server *ServerConn) reg() error {
 	if n < 4 {
 		return errors.New("msg too short")
 	}
-	server.inboundBuffer.Truncate(n)
+	server.inboundBuffer.Write(buf[:n])
 	b := server.inboundBuffer.Next(4)
 	if b[3] != 0 {
 		return protocolErr
 	}
 	msglen := int(b[0]) | int(b[1])<<8 | int(b[2])<<16
 	for olen := server.inboundBuffer.Len(); olen < msglen; olen = server.inboundBuffer.Len() {
-		n, err := server.conn.Read(server.inboundBuffer.Make(msglen))
+		buf = make([]byte, msglen)
+		n, err := server.conn.Read(buf)
 		if err != nil {
 			log.Println("这里3")
 			return err
 		}
-		server.inboundBuffer.Truncate(olen + n)
+		server.inboundBuffer.Write(buf[:n])
 	}
 	if server.inboundBuffer.Next(1)[0] != 10 {
 		return protocolErr
@@ -683,7 +639,7 @@ func (server *ServerConn) reg() error {
 		_, err = server.conn.Write(server.outboundBuffer.Bytes())
 		server.outboundBuffer.Reset()
 		if err != nil {
-			log.Println("这里1")
+			log.Println("这里1", err)
 			return err
 		}
 	}
@@ -695,12 +651,10 @@ func (server *ServerConn) reg() error {
 func (server *ServerConn) handle() {
 	bufnum := 64
 	server.outChan = make(chan *serverOutBuf, bufnum)
-	server.inChan = make(chan *tls.MsgBuffer, bufnum)
+	server.inChan = make(chan []byte)
 	server.outbufchan = make(chan *serverOutBuf, bufnum)
-	server.inbufchan = make(chan *tls.MsgBuffer, bufnum)
 	for i := 0; i < bufnum; i++ {
 		server.outbufchan <- &serverOutBuf{buf: &tls.MsgBuffer{}}
-		server.inbufchan <- &tls.MsgBuffer{}
 	}
 
 	pingdata := make([]byte, 9)
@@ -724,7 +678,7 @@ func (server *ServerConn) handle() {
 		pingdata[5] = byte(pingtime >> 32 & 255)
 		pingdata[6] = byte(pingtime >> 40 & 255)
 		pingdata[7] = byte(pingtime >> 48 & 255)
-		pingdata[8] = byte(pingtime >> 54 & 255)
+		pingdata[8] = byte(pingtime >> 56 & 255)
 		server.tlsconn.Write(pingdata)
 		server.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 		_, err := server.conn.Write(server.outboundBuffer.Bytes())
@@ -747,16 +701,10 @@ func (server *ServerConn) handle() {
 					go server.handleMessage()
 				}
 
-			case in := <-server.inChan:
-				server.do(in.Bytes())
-				in.Reset()
-				server.inbufchan <- in
-				//尽量清空消息以接收pong避免频繁超时断连
+			case b := <-server.inChan:
+				server.do(b)
 				for i := 0; i < len(server.inChan); i++ {
-					in := <-server.inChan
-					server.do(in.Bytes())
-					in.Reset()
-					server.inbufchan <- in
+					server.do(<-server.inChan)
 				}
 			case b := <-server.outChan:
 				if b.c != nil {
@@ -796,10 +744,7 @@ func (server *ServerConn) handle() {
 			case <-server.tick.C:
 				//尽量清空消息以接收pong避免频繁超时断连
 				for i := 0; i < len(server.inChan); i++ {
-					in := <-server.inChan
-					server.do(in.Bytes())
-					in.Reset()
-					server.inbufchan <- in
+					server.do(<-server.inChan)
 				}
 				pingfunc()
 

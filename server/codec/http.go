@@ -2,13 +2,19 @@ package codec
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/crc32"
+
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,505 +22,926 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/gzip"
+	"github.com/luyu6056/cache"
 	"github.com/luyu6056/gnet"
 	"github.com/luyu6056/tls"
 )
 
 type Httpserver struct {
-	Request Request
-	c       gnet.Conn
-	Out     *tls.MsgBuffer
-	Ws      *WSconn
-	data    *bytes.Reader
+	session          *cache.Hashvalue
+	workRequest      *Request
+	c                gnet.Conn
+	ishttps, isClose bool
+	Origin           string
+	Requests         []*Request
+	//StartTime      time.Time
 }
 
+func NewHttpServer(c gnet.Conn, ishttps bool) (hs *Httpserver) {
+	hs = &Httpserver{
+		Requests: make([]*Request, 0),
+		c:        c,
+		ishttps:  ishttps,
+	}
+	hs.workRequest = NewRequest(hs)
+	return
+}
+func (hs *Httpserver) GetWorkRequest() *Request {
+	req := hs.workRequest
+	hs.workRequest = NewRequest(hs)
+	return req
+}
+func (hs *Httpserver) Wake() {
+	if len(hs.Requests) > 1 && hs.Requests[0].dataSize > -1 {
+		end := 0
+		for req := hs.Requests[end]; req.dataSize > -1; req = hs.Requests[end] {
+			req.Httpfinish()
+			req.Recovery()
+			end++
+		}
+		copy(hs.Requests, hs.Requests[end:])
+		hs.Requests = hs.Requests[:len(hs.Requests)-end]
+	}
+}
+func (hs *Httpserver) Close() {
+	if !hs.isClose {
+		//hs.close <- true
+		hs.session = nil
+		hs.c.Close()
+		hs.isClose = true
+	}
+
+}
+
+type httpcookie struct {
+	value   string
+	max_age uint32
+}
+type httpQuery struct {
+	key   string
+	value []string
+}
 type Request struct {
-	Proto, Method string
-	Path, Query   string
-	RemoteAddr    string
-	Connection    string
-	Header        map[string]string
+	hs               *Httpserver
+	Code             int
+	CodeMsg          string
+	Proto, method    string
+	path, query, uri string
+	remoteAddr       string
+	keep_alive       bool
+	header           map[string]string
+	cookie           map[string]string
+	body             []byte
+	queryS           []httpQuery
+	postS            []httpQuery
+	//输出相关
+	connWrite      func([]byte) error
+	outCode        int
+	outContentType string
+	outHeader      map[string]string
+	outCookie      map[string]httpcookie
+	//输出buffer相关
+	data     io.ReadCloser  //消息主体
+	dataSize int            //dataSize大于-1就输出，所以要放到最后赋值
+	out      *tls.MsgBuffer //输出消息用buffer，包含header等信息
+	out1     *tls.MsgBuffer
 }
 
-var Httppool = sync.Pool{New: func() interface{} {
-	hs := &Httpserver{Out: new(tls.MsgBuffer)}
-	hs.Request.Header = make(map[string]string)
-	hs.data = &bytes.Reader{}
-	return hs
+var requestPool = sync.Pool{New: func() interface{} {
+	r := &Request{out: new(tls.MsgBuffer), out1: new(tls.MsgBuffer)}
+	r.outHeader = make(map[string]string)
+	r.outCookie = make(map[string]httpcookie)
+	r.header = make(map[string]string)
+	r.body = make([]byte, 0)
+	r.dataSize = -1
+	return r
 }}
 
-var msgbufpool = sync.Pool{New: func() interface{} {
-	return new(tls.MsgBuffer)
-}}
+func NewRequest(hs *Httpserver) (req *Request) {
+	req = requestPool.Get().(*Request)
+	req.hs = hs
+	req.connWrite = hs.c.WriteNoCodec
+	req.hs.Requests = append(req.hs.Requests, req)
+	return req
+}
+func (r *Request) Recovery() {
+	for k := range r.outHeader {
+		delete(r.outHeader, k)
+	}
+	for k := range r.outCookie {
+		delete(r.outCookie, k)
+	}
+	for k := range r.header {
+		delete(r.header, k)
+	}
+	for k := range r.cookie {
+		delete(r.cookie, k)
+	}
+	r.cookie = nil
+	r.queryS = r.queryS[:0]
+	r.postS = r.postS[:0]
+	r.outCode = 0
+	r.outContentType = ""
+	r.query = ""
+	r.data = nil
+	r.keep_alive = false
+	r.dataSize = -1
+	r.body = r.body[:0]
+	requestPool.Put(r)
+}
+
 var gzippool = sync.Pool{New: func() interface{} {
 	w, _ := gzip.NewWriterLevel(nil, 6)
 	return w
 }}
 
+func (r *Request) Wake() {
+	r.hs.c.Wake()
+}
 func (r *Request) GetHeader(key string) string {
-	return r.Header[key]
+	return r.header[key]
 }
 
-func (hs *Httpserver) Output_data(bin []byte) {
-	hs.Out.Reset()
-	hs.Out.Write(http1head200)
-	hs.Out.Write(http1nocache)
-	hs.data.Reset(bin)
-	hs.httpsfinish(hs.data, len(bin))
+func (r *Request) WriteBuf(b *tls.MsgBuffer) {
+	r.Write(b.Bytes())
 }
-
-func (hs *Httpserver) Ip(c gnet.Conn) (ip string) {
-
-	if ip = hs.Request.GetHeader("X-Real-IP"); ip == "" {
-		ip = c.RemoteAddr().String()
+func (r *Request) WriteString(str string) {
+	r.Write(Str2bytes(str))
+}
+func (r *Request) Write(b []byte) {
+	r.out.Reset()
+	if r.outCode != 0 && httpCode(r.outCode).Bytes() != nil {
+		r.out.Write(httpCode(r.outCode).Bytes())
+	} else {
+		r.out.Write(http1head200)
 	}
+	r.out.Write(http1nocache)
+	if r.outContentType != "" {
+		r.out.WriteString("Content-Type: ")
+		r.out.WriteString(r.outContentType)
+		r.out.WriteString("\r\n")
+	} else {
+		r.out.Write([]byte("Content-Type: text/html;charset=utf-8\r\n"))
+	}
+	r.out1.Reset()
+	if len(b) > 9192 && strings.Contains(r.GetHeader("Accept-Encoding"), "deflate") {
+		w := CompressNoContextTakeover(r.out1, 6)
+		w.Write(b)
+		w.Close()
+		r.out.Write(http1deflate)
+	} else {
+		r.out1.Write(b)
+	}
+	r.data = r.out1
+	r.dataSize = r.out1.Len()
+}
+func (r *Request) WriteNoCompress(b []byte) {
+	r.out.Reset()
+	r.out.Write(http1head200)
+	r.out.Write([]byte("Content-Type: text/html;charset=utf-8\r\n"))
+	r.out1.Reset()
+	r.out1.Write(b)
+	r.data = r.out1
+	r.dataSize = r.out1.Len()
+}
+func (r *Request) RemoteAddr() string {
+	return r.hs.c.RemoteAddr().String()
+}
+func (r *Request) IP() (ip string) {
 
+	if ip = r.GetHeader("X-Real-IP"); ip == "" {
+		ip = r.hs.c.RemoteAddr().String()
+	}
+	re3, _ := regexp.Compile(`:\d+$`)
+	ip = re3.ReplaceAllString(ip, "")
 	return ip
 }
-func (hs *Httpserver) IsMobile() bool {
-	return false
-}
-func (hs *Httpserver) Lastvisit() int32 {
-	return 0
-}
-func (hs *Httpserver) SetLastvisit(int32) {
 
+func (r *Request) UserAgent() string {
+	return r.GetHeader("UserAgent")
 }
-
-func (hs *Httpserver) UserAgent() string {
-	return hs.Request.GetHeader("UserAgent")
+func (r *Request) URI() string {
+	if r.hs.ishttps {
+		return fmt.Sprintf("https://%s%s", r.header["Host"], r.uri)
+	}
+	return fmt.Sprintf("http://%s%s", r.header["Host"], r.uri)
+}
+func (r *Request) Referer() string {
+	return r.header["Referer"]
 }
 
 var errprotocol = errors.New("the client is not using the websocket protocol:")
 
 //http升级为websocket
-func (hs *Httpserver) Upgradews(c gnet.Conn) (err error) {
+func (r *Request) Upgradews() (err error) {
 	//
-	hs.Out.Reset()
+	r.out.Reset()
 	/*if !(strings.Contains(c.Request.Head, "Connection: Upgrade")) {
 
-		hs.Out.WriteString("HTTP/1.1 400 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
-
+		r.out.WriteString("HTTP/1.1 400 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
+		DebugLog("ws协议没有upgrade")
 		return errprotocol
 	}*/
-	if hs.Request.Method != "GET" {
+	if r.method != "GET" {
 
-		hs.Out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
-
+		r.out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
+		DebugLog("ws协议没有get")
 		return errprotocol
 	}
-	/*
-		if !(strings.Contains(c.Request.Head, "Sec-WebSocket-Extensions")) {
+	/*DebugLog(c.Request.Head)
+	if !(strings.Contains(c.Request.Head, "Sec-WebSocket-Extensions")) {
 
-			hs.Out.WriteString("HTTP/1.1 400 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
-
-			return
-		}*/
-
-	/*if config.Server.Origin != "" && hs.Request.Header["Origin"] != config.Server.Origin {
-		hs.Out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
-		return errprotocol
+		r.out.WriteString("HTTP/1.1 400 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
+		DebugLog("ws协议没有Extensions")
+		return
 	}*/
-	if hs.Request.Header["Upgrade"] != "websocket" {
-		hs.Out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
 
+	if r.hs.Origin != "" && r.header["Origin"] != r.hs.Origin {
+		r.out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
+		DebugLog("ws来自错误的Origin")
+		return errprotocol
+	}
+	if r.header["Upgrade"] != "websocket" {
+		r.out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
+		DebugLog("ws协议没有upgrade")
 		return errprotocol
 	}
 
-	if hs.Request.Header["Sec-WebSocket-Version"] != "13" {
-		hs.Out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
-
+	if r.header["Sec-WebSocket-Version"] != "13" {
+		r.out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
+		DebugLog("ws协议没有Extensions")
 		return errprotocol
 	}
 
 	var challengeKey string
 
-	if challengeKey = hs.Request.Header["Sec-WebSocket-Key"]; challengeKey == "" {
-		hs.Out.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
-
+	if challengeKey = r.header["Sec-WebSocket-Key"]; challengeKey == "" {
+		r.WriteString("HTTP/1.1 403 Error\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nUnknonw MSG")
+		DebugLog("ws协议没有Extensions")
 		return errprotocol
 	}
-
-	hs.Ws = &WSconn{
+	id := atomic.AddInt32(&ClientId, 1)
+	ws := &WSconn{
 		IsServer:   true,
 		ReadFinal:  true,
-		Http:       hs,
-		Write:      c.AsyncWrite,
-		IsCompress: strings.Contains(hs.Request.Header["Sec-WebSocket-Extensions"], "permessage-deflate"),
+		Http:       r.hs,
+		Conn:       &ClientConn{BeginTime: time.Now().Unix(), IP: r.IP(), UserAgent: r.GetHeader("User-Agent"), Id: id},
+		Write:      r.hs.c.WriteNoCodec,
+		IsCompress: strings.Contains(r.header["Sec-WebSocket-Extensions"], "permessage-deflate"),
 		readbuf:    &tls.MsgBuffer{},
 	}
-
-	c.SetContext(hs.Ws)
-	hs.Out.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
-	hs.Out.WriteString(ComputeAcceptKey(challengeKey))
-	hs.Out.WriteString("\r\n")
-	if hs.Ws.IsCompress {
-		hs.Out.WriteString("Sec-Websocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n")
+	ws.Conn.Output_data = ws.Output_data
+	r.hs.c.SetContext(ws)
+	r.out.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ")
+	r.out.WriteString(ComputeAcceptKey(challengeKey))
+	r.out.WriteString("\r\n")
+	if ws.IsCompress {
+		r.out.WriteString("Sec-Websocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n")
 	}
-	hs.Out.WriteString("\r\n")
-	hs.c.AsyncWrite(hs.Out.Bytes())
+	r.out.WriteString("\r\n")
+	r.hs.c.WriteNoCodec(r.out.Bytes())
+
 	return nil
 }
 
-func (req *Request) Parsereq(data []byte) (n int, out []byte, err error) {
+func (req *Request) Parsereq(data []byte) (int, []byte, error) {
 	sdata := string(data)
-
 	var i, s int
-	for k := range req.Header {
-		delete(req.Header, k)
-	}
-	//var top string
+	var line string
 	var clen int
 	var q = -1
 	// method, path, proto line
+
 	req.Proto = ""
 	i = bytes.IndexByte(data, 32)
 	if i == -1 {
-		return
+		return 0, nil, nil
 	}
-	req.Method = sdata[:i]
+	req.method = sdata[:i]
 	l := len(sdata)
 	for i, s = i+1, i+1; i < l; i++ {
 		if data[i] == 63 && q == -1 {
 			q = i
 		} else if data[i] == 32 {
 			if q != -1 {
-				req.Path = sdata[s:q]
-				req.Query = sdata[q+1 : i]
+				req.path = sdata[s:q]
+				req.query = sdata[q+1 : i]
 			} else {
-				req.Path = sdata[s:i]
+				req.path = sdata[s:i]
 			}
+			req.uri = sdata[s:i]
 			i++
 			s = bytes.Index(data[i:], []byte{13, 10})
 			if s > -1 {
 				s += i
 				req.Proto = sdata[i:s]
 			}
+
 			break
 		}
 	}
 	switch req.Proto {
 	case "HTTP/1.0":
-		req.Connection = "close"
+		req.keep_alive = false
 	case "HTTP/1.1":
-		req.Connection = "keep-alive"
+		req.keep_alive = true
 	default:
 		return 0, nil, fmt.Errorf("malformed request")
 	}
+	req.body = req.body[:0]
+	//fmt.Println(sdata)
 	for s += 2; s < l; s += i + 2 {
 		i = bytes.Index(data[s:], []byte{13, 10})
-		switch {
-		case i > 15:
-			line := sdata[s : s+i]
+		if i == -1 {
+			return 0, nil, nil
+		}
+		line = sdata[s : s+i]
+		if i > 15 {
 			switch {
 			case line[:15] == "Content-Length:", line[:15] == "Content-length:":
 				clen, _ = strconv.Atoi(line[16:])
 			case line == "Connection: close", line == "Connection: Close":
-				req.Connection = "close"
+				req.keep_alive = false
 			default:
 				j := bytes.IndexByte(data[s:s+i], 58)
 				if j == -1 {
 					return 0, nil, nil
 				}
-				req.Header[line[:j]] = line[j+2:]
+				req.header[line[:j]] = line[j+2:]
 			}
-		case i == 0:
+		} else if i == 0 {
 			s += i + 2
-			if l-s < clen {
-				break
+			if clen == 0 && req.header["Transfer-Encoding"] == "chunked" {
+				req.body = req.body[:0]
+				for ; s < l; s += 2 {
+					i = bytes.Index(data[s:], []byte{13, 10})
+					if i == -1 {
+						return 0, nil, nil
+					}
+					b := make([]byte, 8)
+					if i&1 == 0 {
+						hex.Decode(b[8-i/2:], data[s:s+i])
+					} else {
+						tmp, _ := hex.DecodeString("0" + sdata[s:s+i])
+						copy(b[7-i/2:], tmp)
+
+					}
+					clen = int(b[0])<<56 | int(b[1])<<48 | int(b[2])<<40 | int(b[3])<<32 | int(b[4])<<24 | int(b[5])<<16 | int(b[6])<<8 | int(b[7])
+					s += i + 2
+					if l-s < clen {
+						return 0, nil, nil
+					}
+					if clen > 0 {
+						req.body = append(req.body, data[s:s+clen]...)
+						s += clen
+					} else if l-s == 2 && data[s] == 13 && data[s+1] == 10 {
+						req.decodeQueryPost()
+
+						return s + 2, req.body, nil
+					}
+
+				}
+
+			} else {
+				if l-s < clen {
+					return 0, nil, nil
+				}
+				req.body = append(req.body, data[s:s+clen]...)
+				req.decodeQueryPost()
+
+				return s + clen, req.body, nil
 			}
-			return s + clen, data[s : s+clen], nil
-		case i == -1:
-			return 0, nil, nil
+		} else {
+			j := bytes.IndexByte(data[s:s+i], 58)
+			req.header[line[:j]] = line[j+2:]
 		}
 
 	}
-
 	// not enough data
 	return 0, nil, nil
 }
+func (req *Request) decodeQueryPost() {
+	if req.query != "" {
+		for _, str := range strings.Split(req.query, "&") {
+			s := strings.Split(str, "=")
+			if len(s) == 2 {
+				k, err1 := url.QueryUnescape(s[0])
+				v, err2 := url.QueryUnescape(s[1])
+				if err1 == nil && err2 == nil {
+					req.addquery(k, v)
+				}
+			}
+		}
+	}
+	if req.method == "POST" {
+		if strings.Contains(req.header["Content-Type"], "application/x-www-form-urlencoded") {
+			for _, str := range strings.Split(string(req.body), "&") {
+				if i := strings.Index(str, "="); i > 0 {
+					k, err1 := url.QueryUnescape(str[:i])
+					v, err2 := url.QueryUnescape(str[i+1:])
+					if err1 == nil && err2 == nil {
+						req.addpost(k, v)
+					}
+
+				}
+			}
+		}
+		if strings.Contains(req.header["Content-Type"], "multipart/form-data") {
+			if i := strings.Index(req.header["Content-Type"], "boundary="); i > -1 {
+				for _, str := range strings.Split(string(req.body), "--"+req.header["Content-Type"][i+9:]+"\r\n") {
+					i := strings.Index(str, "\r\n")
+
+					if i > -1 {
+						if strings.Contains(str[:i], "Content-Disposition: form-data;") {
+							var key, value string
+							if j := strings.Index(str[:i], `name="`); j > -1 {
+								key, _ = url.QueryUnescape(str[j+6 : i-1])
+							}
+							if j := strings.Index(str[i+4:], "\r\n"); j > -1 {
+								value, _ = url.QueryUnescape(str[i+4 : i+4+j])
+							}
+							if key != "" {
+								req.addpost(key, value)
+							}
+						}
+
+					}
+
+				}
+			}
+
+		}
+	}
+
+}
+func (req *Request) addquery(name, value string) {
+	for k, v := range req.queryS {
+		if v.key == name {
+			req.queryS[k].value = append(req.queryS[k].value, value)
+			return
+		}
+	}
+	oldlen := len(req.queryS)
+	if oldlen+1 > cap(req.queryS) {
+		req.queryS = append(req.queryS, httpQuery{
+			key:   name,
+			value: []string{value},
+		})
+	} else {
+		req.queryS = req.queryS[:oldlen+1]
+		req.queryS[oldlen].key = name
+		req.queryS[oldlen].value = req.queryS[oldlen].value[:0]
+		req.queryS[oldlen].value = append(req.queryS[oldlen].value, value)
+	}
+}
+func (req *Request) addpost(name, value string) {
+	for k, v := range req.postS {
+		if v.key == name {
+			req.postS[k].value = append(req.postS[k].value, value)
+			return
+		}
+	}
+	oldlen := len(req.postS)
+	if oldlen+1 > cap(req.postS) {
+		req.postS = append(req.postS, httpQuery{
+			key:   name,
+			value: []string{value},
+		})
+	} else {
+		req.postS = req.postS[:oldlen+1]
+		req.postS[oldlen].key = name
+		req.postS[oldlen].value = req.postS[oldlen].value[:0]
+		req.postS[oldlen].value = append(req.postS[oldlen].value, value)
+
+	}
+}
 
 var (
-	static_patch = "./static"
+
+	//http1origin  = []byte("Access-Control-Allow-Origin: " + config.Server.Origin + "\r\n")
 	http1head200 = []byte("HTTP/1.1 200 OK\r\nserver: gnet by luyu6056\r\n")
 	http1head206 = []byte("HTTP/1.1 206 Partial Content\r\nserver: gnet by luyu6056\r\n")
 	http1head304 = []byte("HTTP/1.1 304 Not Modified\r\nserver: gnet by luyu6056\r\n")
-	http1deflate = []byte("\r\nContent-encoding: deflate")
-	http1gzip    = []byte("\r\nContent-encoding: gzip")
+	http1deflate = []byte("Content-encoding: deflate\r\n")
+	http1gzip    = []byte("Content-encoding: gzip\r\n")
 	http404b, _  = ioutil.ReadFile(static_patch + "/404.html")
 	http1cache   = []byte("Cache-Control: max-age=86400\r\n")
 	http1nocache = []byte("Cache-Control: no-store, no-cache, must-revalidate, max-age=0, s-maxage=0\r\nPragma: no-cache\r\n")
 )
 
-func (hs *Httpserver) Static() {
-	hs.Out.Reset()
-	etag := hs.Request.GetHeader("etag")
-	filename := hs.Request.Path
+func (r *Request) StaticHandler() gnet.Action {
+	r.out.Reset()
+	r.out1.Reset()
+	etag := r.GetHeader("If-None-Match")
+	filename := r.path
 	if filename == "/" {
 		filename = "/index.html"
 	}
+
+	isdeflate := strings.Contains(r.GetHeader("Accept-Encoding"), "deflate")
+	var isgzip bool
+	if !isdeflate {
+		isgzip = strings.Contains(r.GetHeader("Accept-Encoding"), "gzip")
+	}
+	filename = static_patch + filename
+	var f_cache *file_cache
+	var f_cache_err error
+	if cache, ok := static_cache.Load(filename); ok { //这个cache在http2那边
+		f_cache = cache.(*file_cache)
+
+		//有缓存，检查文件是否修改
+		if !httpIswatcher && f_cache.etag != "" && atomic.CompareAndSwapUint32(&f_cache.check, 0, 1) {
+			f_cache_err, f_cache = f_cache.Check(filename)
+			time.AfterFunc(time.Second, func() { f_cache.check = 0 })
+		}
+	} else {
+		if httpIswatcher {
+			httpWatcher.Add(filename)
+		}
+		f_cache_err, f_cache = f_cache.Check(filename)
+
+	}
+
+	if f_cache_err == nil {
+		if f_cache.etag == etag {
+			r.out.Write(http1head304)
+		} else if isdeflate && f_cache.iscompress { //deflate压缩资源
+			r.out.Write(http1head200)
+			r.out.WriteString("Content-Type: ")
+			r.out.WriteString(f_cache.content_type)
+			r.out.WriteString("\r\n")
+			r.out.Write(http1deflate)
+			r.out1.Write(f_cache.deflatefile)
+		} else if isgzip && f_cache.iscompress { //gzip可压缩资源
+			r.out.Write(http1head200)
+			r.out.WriteString("Content-Type: ")
+			r.out.WriteString(f_cache.content_type)
+			r.out.WriteString("\r\n")
+			r.out.Write(http1gzip)
+			g := gzippool.Get().(*gzip.Writer)
+			defer gzippool.Put(g)
+			g.Reset(r.out1)
+			g.Write(f_cache.file)
+			g.Flush()
+		} else { //非压缩资源
+			r.out.Write(http1head200)
+			r.out.WriteString("Content-Type: ")
+			r.out.WriteString(f_cache.content_type)
+			r.out.WriteString("\r\n")
+			r.out1.Write(f_cache.file)
+		}
+		r.out.WriteString("Etag: ")
+		r.out.WriteString(f_cache.etag)
+		r.out.WriteString("\r\n")
+		r.data = r.out1
+		r.dataSize = r.out1.Len()
+		return gnet.None
+	} else {
+		switch f_cache_err {
+		case file_cache_err_NotFound:
+			r.Out404()
+		case file_cache_file_TooLarge:
+			f, err := os.Open(filename)
+			if err != nil {
+				r.OutErr(err)
+				return gnet.None
+			}
+			fstat, err := f.Stat()
+			if err != nil {
+				r.OutErr(err)
+				return gnet.None
+			}
+			r.RangeDownload(f, fstat.Size(), filename)
+		default:
+			r.OutErr(errors.New("Unknown Error"))
+		}
+
+	}
+	return gnet.None
+}
+
+type HttpIoReader interface {
+	Seek(int64, int) (int64, error)
+	Read([]byte) (int, error)
+	Close() error
+}
+
+func (r *Request) RangeDownload(b HttpIoReader, size int64, name string) {
+	r.out.Reset()
 	var range_start, range_end int
-	if r := hs.Request.GetHeader("range"); strings.Index(r, "bytes=") == 0 {
+	if r := r.GetHeader("range"); strings.Index(r, "bytes=") == 0 {
 		if e := strings.Index(r, "-"); e > 6 {
 			range_start, _ = strconv.Atoi(r[6:e])
 			range_end, _ = strconv.Atoi(r[e+1:])
 		}
 	}
-	isdeflate := strings.Contains(hs.Request.GetHeader("Accept-Encoding"), "deflate")
-	var isgzip bool
-	if !isdeflate {
-		isgzip = strings.Contains(hs.Request.GetHeader("Accept-Encoding"), "gzip")
-	}
-	filename = static_patch + filename
-	var f_cache *file_cache
-	if cache, ok := static_cache.Load(filename); ok {
-		f_cache = cache.(*file_cache)
-	} else {
-		f_cache = &file_cache{}
-	}
-	var f *os.File
-	var fstat os.FileInfo
-	var err error
-	//有缓存，检查文件是否修改
-	if f_cache.etag != "" && atomic.CompareAndSwapUint32(&f_cache.check, 0, 1) {
-		f, err = os.Open(filename)
-		if err != nil {
-			f_cache.etag = ""
-			hs.Out404(err)
-
+	if range_start > 0 || range_end > 0 {
+		r.out.Write(http1head206)
+		if range_end == 0 {
+			range_end = int(size)
+		}
+		if _, e := b.Seek(int64(range_start), 0); e != nil {
+			r.OutErr(e)
 			return
 		}
-		defer f.Close()
-		fstat, err = f.Stat()
-		if err != nil {
-			f_cache.etag = ""
-			hs.Out404(err)
+		r.out.WriteString("Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ")
 
+		r.out.WriteString(strconv.Itoa(range_start))
+		r.out.WriteString("-")
+		r.out.WriteString(strconv.Itoa(range_end))
+		r.out.WriteString("/")
+		r.out.WriteString(strconv.Itoa(int(size)))
+		r.out.WriteString("\r\n")
+		r.out.WriteString(`Content-Disposition: attachment; filename*="utf8''` + url.QueryEscape(name) + `"` + "\r\n")
+		r.data = b
+		r.dataSize = range_end - range_start
+	} else {
+		r.out.Write(http1head200)
+		r.out.WriteString("Content-Type: application/octet-stream\r\n")
+		r.out.WriteString(`Content-Disposition: attachment; filename*="utf8''` + url.QueryEscape(name) + `"` + "\r\n")
+		r.data = b
+		r.dataSize = int(size)
+	}
+}
+func (r *Request) Httpfinish() {
+	if r.hs.ishttps {
+		r.out.Write([]byte("strict-transport-security: max-age=31536000; includeSubDomains\r\n"))
+	}
+	for k, v := range r.outHeader {
+		r.out.WriteString(k)
+		r.out.WriteString(": ")
+		r.out.WriteString(v)
+		r.out.WriteString("\r\n")
+	}
+
+	for k, v := range r.outCookie {
+		r.out.WriteString("Set-Cookie: ")
+		r.out.WriteString(url.QueryEscape(k))
+		r.out.WriteString("=")
+		r.out.WriteString(url.QueryEscape(v.value))
+		if v.max_age > 0 {
+			r.out.WriteString("; Max-age=")
+			r.out.WriteString(strconv.FormatUint(uint64(v.max_age), 10))
+		}
+		r.out.WriteString("; path=/\r\n")
+	}
+	if r.keep_alive {
+		r.out.Write([]byte("Connection: keep-alive"))
+	} else {
+		r.out.Write([]byte("Connection: close"))
+	}
+	r.out.WriteString("\r\nContent-Length: ")
+	r.out.WriteString(strconv.Itoa(r.dataSize))
+	if r.dataSize > 0 {
+
+		r.out.WriteString("\r\n\r\n")
+		defer r.data.Close()
+		for msglen := r.dataSize; msglen > 0; msglen = r.dataSize {
+			if msglen > http2initialMaxFrameSize*100-r.out.Len() { //切分为一个tls包
+				msglen = http2initialMaxFrameSize*100 - r.out.Len()
+			}
+			if _, e := r.data.Read(r.out.Make(msglen)); e != nil {
+				DebugLog("httpsfinish Read错误%v", e)
+				return
+			}
+			if r.dataSize > msglen {
+				r.hs.c.FlushWrite(r.out.Bytes(), true)
+			} else {
+				r.connWrite(r.out.Bytes())
+			}
+
+			r.out.Reset()
+			r.dataSize -= msglen
+		}
+	} else {
+		r.out.WriteString("\r\n\r\n")
+		r.connWrite(r.out.Bytes())
+	}
+	return
+}
+func (r *Request) Out404() {
+	r.out.Reset()
+	r.out1.Reset()
+	r.out.WriteString("HTTP/1.1 404 Not Found\r\n")
+	r.out1.Write(http404b)
+	r.data = r.out1
+	r.dataSize = r.out1.Len()
+}
+
+var Errfunc func(i interface{}, err error) bool
+
+func (r *Request) OutErr(err error) {
+	if Errfunc != nil {
+		if Errfunc(r, err) {
 			return
 		}
-		if t := fstat.ModTime().Unix(); t > f_cache.modTime {
-			f_cache.etag = ""
-			f_cache.modTime = t
-		}
-		time.AfterFunc(time.Second, func() { f_cache.check = 0 })
 	}
-	if f_cache.etag != "" {
-		if f_cache.etag == etag {
-			hs.Out.Write(http1head304)
-			hs.data.Reset(nil)
-		} else if isdeflate && len(f_cache.deflatefile) > 0 {
-			hs.Out.Write(http1head200)
-			hs.Out.WriteString("Content-Type: ")
-			hs.Out.WriteString(f_cache.content_type)
-			hs.Out.Write(http1deflate)
-			hs.data.Reset(f_cache.deflatefile)
-		} else {
-			hs.Out.Write(http1head200)
-			hs.Out.WriteString("Content-Type: ")
-			hs.Out.WriteString(f_cache.content_type)
-			hs.data.Reset(f_cache.file)
-		}
-		hs.Out.WriteString("\r\netag: ")
-		hs.Out.WriteString(f_cache.etag)
-		hs.Out.WriteString("\r\n")
-		hs.httpsfinish(hs.data, hs.data.Len())
-
-		return
-	} else {
-		//大文件时速度比较慢，目前的模式是小文件crc etag+缓存模式
-		if f == nil {
-			f, err = os.Open(filename)
-			if err != nil {
-				hs.Out404(err)
-
-				return
-			}
-			defer f.Close()
-			fstat, err = f.Stat()
-			if err != nil {
-				hs.Out404(err)
-
-				return
-			}
-			f_cache.modTime = fstat.ModTime().Unix()
-		}
-		if fstat.Size() < 1024*1024*5 { //暂定5Mb是大文件
-			b := make([]byte, fstat.Size())
-			n, err := io.ReadFull(f, b)
-			msglen := n
-			if err != nil || n != int(fstat.Size()) {
-				hs.Out404(err)
-
-				return
-			} else {
-				f_cache.file = make([]byte, len(b))
-				copy(f_cache.file, b)
-				f_cache.etag = strconv.Itoa(int(crc32.ChecksumIEEE(b)))
-				hs.Out.Write(http1head200)
-				s := strings.Split(filename, ".")
-				name := s[len(s)-1]
-				switch {
-				case strings.Contains(name, "css"):
-					hs.Out.WriteString("Content-Type: text/css")
-					f_cache.content_type_h2 = headerField_content_type_css
-					f_cache.content_type = "text/css"
-				case strings.Contains(name, "html"):
-					hs.Out.WriteString("Content-Type: text/html;charset=utf-8")
-					f_cache.content_type_h2 = headerField_content_type_html
-					f_cache.content_type = "text/html;charset=utf-8"
-				case strings.Contains(name, "js"):
-					hs.Out.WriteString("Content-Type: application/javascript")
-					f_cache.content_type_h2 = headerField_content_type_js
-					f_cache.content_type = "application/javascript"
-				case strings.Contains(name, "gif"):
-					isgzip = false
-					isdeflate = false
-					hs.Out.WriteString("Content-Type: image/gif")
-					f_cache.content_type_h2 = headerField_content_type_gif
-					f_cache.content_type = "image/gif"
-				case strings.Contains(name, "png"):
-					isgzip = false
-					isdeflate = false
-					hs.Out.WriteString("Content-Type: image/png")
-					f_cache.content_type_h2 = headerField_content_type_png
-					f_cache.content_type = "image/png"
-				default:
-					isgzip = false
-					isdeflate = false
-					hs.Out.WriteString("Content-Type: application/octet-stream")
-					f_cache.content_type_h2 = headerField_content_type_default
-					f_cache.content_type = "application/octet-stream"
-				}
-				if len(b) > 512 && (isgzip || isdeflate) {
-					switch {
-					case isdeflate:
-						buf := msgbufpool.Get().(*tls.MsgBuffer)
-						defer msgbufpool.Put(buf)
-						buf.Reset()
-						w := CompressNoContextTakeover(buf, 6)
-						w.Write(b)
-						w.Close()
-						hs.Out.Write(http1deflate)
-						f_cache.deflatefile = make([]byte, buf.Len())
-						copy(f_cache.deflatefile, buf.Bytes())
-						hs.data.Reset(buf.Bytes())
-						msglen = buf.Len()
-					case isgzip:
-						g := gzippool.Get().(*gzip.Writer)
-						buf := msgbufpool.Get().(*tls.MsgBuffer)
-						defer msgbufpool.Put(buf)
-						buf.Reset()
-						g.Reset(buf)
-						g.Write(b)
-						g.Flush()
-						hs.Out.Write(http1gzip)
-						hs.data.Reset(buf.Bytes())
-						gzippool.Put(g)
-						msglen = buf.Len()
-					}
-				} else {
-					hs.data.Reset(b)
-				}
-				static_cache.Store(filename, f_cache)
-				hs.Out.WriteString("\r\netag: ")
-				hs.Out.WriteString(f_cache.etag)
-				hs.Out.WriteString("\r\n")
-				hs.Out.Write(http1cache)
-				hs.httpsfinish(hs.data, msglen)
-
-			}
-		} else {
-
-			if range_start > 0 || range_end > 0 {
-
-				hs.Out.Write(http1head206)
-				if range_end == 0 {
-					range_end = int(fstat.Size())
-				}
-				f.Seek(int64(range_start), 0)
-				hs.Out.WriteString("Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ")
-				hs.Out.WriteString(strconv.Itoa(range_start))
-				hs.Out.WriteString("-")
-				hs.Out.WriteString(strconv.Itoa(range_end))
-				hs.Out.WriteString("/")
-				hs.Out.WriteString(strconv.Itoa(int(fstat.Size())))
-				hs.httpsfinish(f, range_end-range_start)
-			} else {
-				hs.Out.Write(http1head200)
-				hs.Out.WriteString("Content-Type: application/octet-stream\r\n")
-				hs.httpsfinish(f, int(fstat.Size()))
-			}
-
-		}
-
-	}
+	r.out.Reset()
+	r.out1.Reset()
+	r.out.WriteString("HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html;charset=utf-8\r\n")
+	r.out1.WriteString(err.Error())
+	r.data = r.out1
+	r.dataSize = r.out1.Len()
 }
-func (hs *Httpserver) httpsfinish(b io.Reader, l int) {
-	hs.Out.WriteString("Connection: ")
-	hs.Out.WriteString(hs.Request.Connection)
 
-	hs.Out.WriteString("\r\nContent-Length: ")
-	hs.Out.WriteString(strconv.Itoa(l))
-	hs.Out.WriteString("\r\n\r\n")
-
-	for msglen := l; msglen > 0; msglen = l {
-		if msglen > http2initialMaxFrameSize*100-hs.Out.Len() {
-			msglen = http2initialMaxFrameSize*100 - hs.Out.Len()
-		}
-		b.Read(hs.Out.Make(msglen))
-		hs.c.AsyncWrite(hs.Out.Bytes())
-		hs.Out.Reset()
-		l -= msglen
-	}
-	if l := hs.Out.Len(); l > 0 {
-		hs.c.AsyncWrite(hs.Out.Next(l))
-	}
-}
-func (hs *Httpserver) Out404(err error) {
-	hs.Out.WriteString("HTTP/1.1 404 Not Found\r\nContent-Length: ")
-	hs.Out.WriteString(strconv.Itoa(len(http404b)))
-	hs.Out.WriteString("\r\n\r\n")
-	hs.Out.Write(http404b)
-	hs.c.AsyncWrite(hs.Out.Bytes())
-}
-func (hs *Httpserver) RandOut() {
-	hs.Out.Reset()
-	f, err := os.Open(static_patch + "/tmp")
-	if err != nil {
-		hs.Out404(err)
-		return
-	}
-	defer f.Close()
-	f_info, err := f.Stat()
-	if err != nil {
-		hs.Out404(err)
-
-		return
-	}
-	randlen := 1024*1024*10 + rand.Intn(1024*1024*10) //生成的随机长度，10+10MB
-	hs.Out.Write(http1head200)
-	hs.Out.Write(http1nocache)
-	hs.Out.WriteString("Connection: ")
-	hs.Out.WriteString(hs.Request.Connection)
-	hs.Out.WriteString("\r\nContent-Length: ")
-	hs.Out.WriteString(strconv.Itoa(randlen))
-	hs.Out.WriteString("\r\n\r\n")
-	for msglen := randlen; randlen > 0; msglen = randlen {
-		if msglen > http2initialMaxFrameSize-hs.Out.Len() { //切分为一个tls包
-			msglen = http2initialMaxFrameSize - hs.Out.Len()
-		}
-		//设置随机起点
-		f.Seek(rand.Int63n(f_info.Size()-int64(msglen)), 0)
-		//读取一段长度
-		f.Read(hs.Out.Make(msglen))
-		hs.c.AsyncWrite(hs.Out.Bytes())
-		hs.Out.Reset()
-		randlen -= msglen
-	}
-}
 func init() {
 
 	if http404b == nil {
 		http404b = []byte("404 not found")
 	}
+}
+
+func (req *Request) Close() {
+	req.hs.Close()
+}
+
+var sessionID = uint64(rand.NewSource(time.Now().Unix()).Int63())
+
+func (r *Request) Session() *cache.Hashvalue {
+	if r.hs.session == nil {
+		//检查sessionID
+		var has bool
+		sessionIdKey := r.Cookie("sessionID")
+		if sessionIdKey != "" {
+			r.hs.session, has = cache.Has(sessionIdKey, "session")
+		}
+		//不存在则创建一个
+		if !has {
+			has = true
+			//循环检查到一个没用过的sessionIdKey
+			for has {
+				b := make([]byte, 8)
+				binary.LittleEndian.PutUint64(b, atomic.AddUint64(&sessionID, 1))
+				sha := sha256.Sum256(Str2bytes(strconv.FormatInt(time.Now().UnixNano(), 10) + string(b)))
+				sessionIdKey = strings.TrimRight(base64.URLEncoding.EncodeToString(sha[:]), "=")
+				_, has = cache.Has(sessionIdKey, "session")
+			}
+			r.SetCookie("sessionID", sessionIdKey, 7*86400)
+			r.hs.session = cache.Hget(sessionIdKey, "session")
+			r.hs.session.Set("sessionID", sessionIdKey)
+			r.hs.session.Expire(8 * 3600) //给个临时session
+		}
+	}
+	return r.hs.session
+}
+func (r *Request) DelSession() {
+	if r.hs.session != nil {
+		r.hs.session.Hdel()
+	}
+}
+func (r *Request) Body() []byte {
+	return r.body
+}
+func (r *Request) Method() string {
+	return r.method
+}
+func (r *Request) Header(name string) string {
+	return r.header[name]
+}
+func (r *Request) SetHeader(name, value string) {
+	r.outHeader[name] = value
+}
+func (r *Request) SetCookie(name, value string, max_age uint32) {
+	r.outCookie[name] = httpcookie{
+		value:   value,
+		max_age: max_age,
+	}
+}
+func (r *Request) Redirect(url string) {
+	r.out.Reset()
+	r.out.WriteString("HTTP/1.1 302 OK\r\nserver: gnet by luyu6056\r\nCache-Control: Max-age=0\r\nContent-Type: text/html;charset=utf-8\r\nLocation: ")
+	r.out.WriteString(url)
+	r.out.WriteString("\r\n")
+	r.out1.Reset()
+	r.data = r.out1
+	r.dataSize = 0
+}
+
+func (r *Request) Cookie(name string) string {
+	if cookieHead, ok := r.header["Cookie"]; ok {
+		for _, cookie := range strings.Split(cookieHead, "; ") {
+			if i := strings.Index(cookie, "="); i > 0 && cookie[:i] == name {
+				v, _ := url.QueryUnescape(cookie[i+1:])
+				return v
+			}
+		}
+	}
+	return ""
+}
+func (r *Request) Path() string {
+
+	return r.path
+}
+func (r *Request) Query(key string) string {
+	for _, q := range r.queryS {
+		if q.key == key {
+			return q.value[0]
+		}
+	}
+	return ""
+}
+
+func (r *Request) Post(key string) (value string) {
+	for _, q := range r.postS {
+		if q.key == key {
+			return q.value[0]
+		}
+	}
+	return
+}
+func (r *Request) PostSlice(key string) []string {
+	for _, q := range r.postS {
+		if q.key == key {
+			return q.value
+		}
+	}
+	return nil
+}
+func (r *Request) GetAllPost() (res map[string][]string) {
+	res = make(map[string][]string, len(r.postS))
+	for _, v := range r.postS {
+		res[v.key] = v.value
+	}
+	return res
+}
+func (r *Request) GetAllQuery() (res map[string][]string) {
+	res = make(map[string][]string, len(r.queryS))
+	for _, v := range r.queryS {
+		res[v.key] = v.value
+	}
+	return res
+}
+func (r *Request) AddQuery(name, value string) {
+	r.addquery(name, value)
+}
+
+func (r *Request) SetCode(code int) {
+	r.outCode = code
+}
+func (r *Request) SetContentType(ContentType string) {
+	r.outContentType = ContentType
+}
+
+type httpCode int
+
+func (code httpCode) Bytes() []byte {
+	return map[int][]byte{
+		100: []byte("HTTP/1.1 100 Continue\r\n"),
+		101: []byte("HTTP/1.1 101 Switching Protocols\r\n"),
+		102: []byte("HTTP/1.1 102 Processing\r\n"),
+		200: []byte("HTTP/1.1 200 OK\r\n"),
+		201: []byte("HTTP/1.1 201 Created\r\n"),
+		202: []byte("HTTP/1.1 202 Accepted\r\n"),
+		203: []byte("HTTP/1.1 203 Non-Authoritative Information\r\n"),
+		204: []byte("HTTP/1.1 204 No Content\r\n"),
+		205: []byte("HTTP/1.1 205 Reset Content\r\n"),
+		206: []byte("HTTP/1.1 206 Partial Content\r\n"),
+		207: []byte("HTTP/1.1 207 Multi-Status\r\n"),
+		300: []byte("HTTP/1.1 300 Multiple Choices\r\n"),
+		301: []byte("HTTP/1.1 301 Moved Permanently\r\n"),
+		302: []byte("HTTP/1.1 302 Move Temporarily\r\n"),
+		303: []byte("HTTP/1.1 303 See Other\r\n"),
+		304: []byte("HTTP/1.1 304 Not Modified\r\n"),
+		305: []byte("HTTP/1.1 305 Use Proxy\r\n"),
+		306: []byte("HTTP/1.1 306 Switch Proxy\r\n"),
+		307: []byte("HTTP/1.1 307 Temporary Redirect\r\n"),
+		400: []byte("HTTP/1.1 400 Bad Request\r\n"),
+		401: []byte("HTTP/1.1 401 Unauthorized\r\n"),
+		402: []byte("HTTP/1.1 402 Payment Required\r\n"),
+		403: []byte("HTTP/1.1 403 Forbidden\r\n"),
+		404: []byte("HTTP/1.1 404 Not Found\r\n"),
+		405: []byte("HTTP/1.1 405 Method Not Allowed\r\n"),
+		406: []byte("HTTP/1.1 406 Not Acceptable\r\n"),
+		407: []byte("HTTP/1.1 407 Proxy Authentication Required\r\n"),
+		408: []byte("HTTP/1.1 408 Request Timeout\r\n"),
+		409: []byte("HTTP/1.1 409 Conflict\r\n"),
+		410: []byte("HTTP/1.1 410 Gone\r\n"),
+		411: []byte("HTTP/1.1 411 Length Required\r\n"),
+		412: []byte("HTTP/1.1 412 Precondition Failed\r\n"),
+		413: []byte("HTTP/1.1 413 Request Entity Too Large\r\n"),
+		414: []byte("HTTP/1.1 414 Request-URI Too Long\r\n"),
+		415: []byte("HTTP/1.1 415 Unsupported Media Type\r\n"),
+		416: []byte("HTTP/1.1 416 Requested Range Not Satisfiable\r\n"),
+		417: []byte("HTTP/1.1 417 Expectation Failed\r\n"),
+		418: []byte("HTTP/1.1 418 I'm a teapot\r\n"),
+		421: []byte("HTTP/1.1 421 Misdirected Request\r\n"),
+		422: []byte("HTTP/1.1 422 Unprocessable Entity\r\n"),
+		423: []byte("HTTP/1.1 423 Locked\r\n"),
+		424: []byte("HTTP/1.1 424 Failed Dependency\r\n"),
+		425: []byte("HTTP/1.1 425 Too Early\r\n"),
+		426: []byte("HTTP/1.1 426 Upgrade Required\r\n"),
+		449: []byte("HTTP/1.1 449 Retry With\r\n"),
+		451: []byte("HTTP/1.1 451 Unavailable For Legal Reasons\r\n"),
+		500: []byte("HTTP/1.1 500 Internal Server Error\r\n"),
+		501: []byte("HTTP/1.1 501 Not Implemented\r\n"),
+		502: []byte("HTTP/1.1 502 Bad Gateway\r\n"),
+		503: []byte("HTTP/1.1 503 Service Unavailable\r\n"),
+		504: []byte("HTTP/1.1 504 Gateway Timeout\r\n"),
+		505: []byte("HTTP/1.1 505 HTTP Version Not Supported\r\n"),
+		506: []byte("HTTP/1.1 506 Variant Also Negotiates\r\n"),
+		507: []byte("HTTP/1.1 507 Insufficient Storage\r\n"),
+		509: []byte("HTTP/1.1 509 Bandwidth Limit Exceeded\r\n"),
+		510: []byte("HTTP/1.1 510 Not Extended\r\n"),
+		600: []byte("HTTP/1.1 600 Unparseable Response Headers\r\n"),
+	}[int(code)]
 }

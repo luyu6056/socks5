@@ -18,14 +18,15 @@ import (
 
 // The message types are defined in RFC 6455, section 11.8.
 const (
-	wsfpslimit = 200 //帧率限制
+	wsfpslimit  = 999999999 //帧率限制
+	wsMaxMsglen = 2<<24 - 1
 	// TextMessage denotes a text data message. The text message payload is
 	// interpreted as UTF-8 encoded text data.
 	TextMessage = 1
 
 	// BinaryMessage denotes a binary data message.
-	BinaryMessage         = 2
-	BinaryMessagefinalBit = BinaryMessage | finalBit
+	BinaryMessage = 2
+
 	// CloseMessage denotes a close control message. The optional message
 	// payload contains a numeric code and text. Use the FormatCloseMessage
 	// function to format a close message payload.
@@ -54,10 +55,12 @@ const (
 	maxControlFramePayloadSize = 125
 
 	defaultReadBufferSize  = 4096
-	defaultWriteBufferSize = 8192
+	defaultWriteBufferSize = 81920
 
-	continuationFrame = 0
-	noFrame           = -1
+	continuationFrame         = 0
+	continuationFramefinalBit = continuationFrame | finalBit
+	BinaryMessagefinalBit     = BinaryMessage | finalBit
+	noFrame                   = -1
 )
 
 // Close codes defined in RFC 6455, section 11.7.
@@ -98,10 +101,12 @@ type WSconn struct {
 	ReadLength     int  // Message size.
 	readDecompress bool
 	IsServer       bool
+	Conn           *ClientConn
 	Write          func([]byte) error
 	readbuf        *tls.MsgBuffer //读取分帧和解压用
 	messageType    int
 	fps            uint32
+	Handler        func(*Context)
 }
 
 var buf_pool = sync.Pool{New: func() interface{} {
@@ -111,33 +116,33 @@ var buf_pool = sync.Pool{New: func() interface{} {
 func (c *WSconn) ReadMessage(in []byte) (frameType int, result []byte, err error) {
 	// Close previous reader, only relevant for decompression.
 	c.ReadLength = 0
-	for {
-		frameType, err = c.advanceFrame(in)
-		if err != nil {
-			err = hideTempErr(err)
-			break
+	frameType, err = c.advanceFrame(in)
+	if err != nil {
+		err = hideTempErr(err)
+		return noFrame, nil, err
+	}
+	if frameType == noFrame {
+		return noFrame, nil, err
+	}
+	if frameType == TextMessage || frameType == BinaryMessage {
+		c.messageType = frameType
+	}
+	if c.ReadFinal {
+		if fps := atomic.AddUint32(&c.fps, 1); fps == 1 {
+			time.AfterFunc(time.Second, func() { c.fps = 0 })
+		} else if fps > wsfpslimit {
+			return noFrame, nil, io.EOF
 		}
-		if frameType == noFrame {
-			break
-		}
-		if frameType == TextMessage || frameType == BinaryMessage {
-			c.messageType = frameType
-		}
-		if c.ReadFinal {
-			if fps := atomic.AddUint32(&c.fps, 1); fps == 1 {
-				time.AfterFunc(time.Second, func() { c.fps = 0 })
-			} else if fps > wsfpslimit {
-				return noFrame, nil, io.EOF
-			}
-			if c.readDecompress {
-				c.readDecompress = false
-				p, err := ioutil.ReadAll(DecompressNoContextTakeover(c.readbuf))
-				return c.messageType, p, err
-			}
+		if c.readDecompress {
 			c.readDecompress = false
-
-			return c.messageType, c.readbuf.Next(c.readbuf.Len()), nil
+			p, err := ioutil.ReadAll(DecompressNoContextTakeover(c.readbuf))
+			return c.messageType, p, err
 		}
+		c.readDecompress = false
+		if c.readbuf.Len() > wsMaxMsglen {
+			return noFrame, nil, ErrReadLimit
+		}
+		return c.messageType, c.readbuf.Next(c.readbuf.Len()), nil
 	}
 	return noFrame, nil, err
 }
@@ -171,28 +176,6 @@ func (c *WSconn) advanceFrame(in []byte) (int, error) {
 		return noFrame, c.handleProtocolError("unexpected reserved bits 0x" + strconv.FormatInt(int64(rsv), 16))
 	}
 
-	switch frameType {
-	case CloseMessage, PingMessage, PongMessage:
-		if c.readRemaining > maxControlFramePayloadSize {
-			return noFrame, c.handleProtocolError("control frame length > 125")
-		}
-		if !final {
-			return noFrame, c.handleProtocolError("control frame not final")
-		}
-	case TextMessage, BinaryMessage:
-		if !c.ReadFinal {
-			return noFrame, c.handleProtocolError("message start before final message frame")
-		}
-		c.ReadFinal = final
-	case continuationFrame:
-		if c.ReadFinal {
-			return noFrame, c.handleProtocolError("continuation after final message frame")
-		}
-		c.ReadFinal = final
-	default:
-		return noFrame, c.handleProtocolError("unknown opcode " + strconv.Itoa(frameType))
-	}
-
 	// 3. Read and parse frame length.
 
 	switch c.readRemaining {
@@ -201,15 +184,15 @@ func (c *WSconn) advanceFrame(in []byte) (int, error) {
 			return noFrame, nil
 		}
 		c.readRemaining = int(p[2])<<8 | int(p[3])
-		readlength = 4
+		readlength = msgheader + msglength2
 	case 127:
 		if len(p) < 10 {
 			return noFrame, nil
 		}
 		c.readRemaining = int(p[2])<<56 | int(p[3])<<48 | int(p[4])<<40 | int(p[5])<<32 | int(p[6])<<24 | int(p[7])<<16 | int(p[8])<<8 | int(p[9])
-		readlength = 8
+		readlength = msgheader + msglength8
 	default:
-		readlength = 2
+		readlength = msgheader
 	}
 
 	// 4. Handle frame masking.
@@ -231,9 +214,32 @@ func (c *WSconn) advanceFrame(in []byte) (int, error) {
 		}
 	} else {
 		if len(p) < c.readRemaining+readlength {
+
 			return noFrame, nil
 		}
 		payload = p[readlength : c.readRemaining+readlength]
+	}
+
+	switch frameType {
+	case CloseMessage, PingMessage, PongMessage:
+		if c.readRemaining > maxControlFramePayloadSize {
+			return noFrame, c.handleProtocolError("control frame length > 125")
+		}
+		if !final {
+			return noFrame, c.handleProtocolError("control frame not final")
+		}
+	case TextMessage, BinaryMessage:
+		if !c.ReadFinal {
+			return noFrame, c.handleProtocolError("message start before final message frame")
+		}
+		c.ReadFinal = final
+	case continuationFrame:
+		if c.ReadFinal {
+			return noFrame, c.handleProtocolError("continuation after final message frame")
+		}
+		c.ReadFinal = final
+	default:
+		return noFrame, c.handleProtocolError("unknown opcode " + strconv.Itoa(frameType))
 	}
 	readlength += c.readRemaining
 	c.ReadLength += readlength
@@ -243,11 +249,9 @@ func (c *WSconn) advanceFrame(in []byte) (int, error) {
 		//	c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
 		//	return noFrame, ErrReadLimit
 		//}
-
 		c.readbuf.Write(payload)
 		return frameType, nil
 	}
-
 	// 7. Process control frame payload.
 
 	switch frameType {
@@ -406,7 +410,7 @@ func (c *WSconn) Output_data(msg *tls.MsgBuffer) { //专用的server输出
 	if c.IsCompress && msg.Len() > 256 { //太小的不压缩
 		mw.compress = true
 		mw.writeBuf.Reset()
-		w := CompressNoContextTakeover(mw.writeBuf, 3)
+		w := CompressNoContextTakeover(mw.writeBuf, 6)
 		w.Write(msg.Bytes())
 		w.Close()
 		msg = mw.writeBuf //把压缩过的消息，写回msg
@@ -415,12 +419,12 @@ func (c *WSconn) Output_data(msg *tls.MsgBuffer) { //专用的server输出
 	if mw.compress {
 		mw.outbuf[0] |= rsv1Bit
 	}
-	for length := msg.Len(); length > 0; length, mw.outbuf[0] = length-defaultWriteBufferSize, continuationFrame {
-		msglen := length
+	for msglen := msg.Len(); msglen > 0; msglen, mw.outbuf[0] = msg.Len(), continuationFramefinalBit {
+
 		if msglen > defaultWriteBufferSize {
 			msglen = defaultWriteBufferSize //当前帧长度，不大于帧大小
+			mw.outbuf[0] -= finalBit
 		}
-
 		switch {
 		case msglen >= 65536:
 			mw.outbuf[1] = 127
@@ -444,9 +448,7 @@ func (c *WSconn) Output_data(msg *tls.MsgBuffer) { //专用的server输出
 			mw.outbuf[1] = byte(msglen)
 			copy(mw.outbuf[2:], msg.Next(msglen))
 		}
-		if length > defaultWriteBufferSize {
-			mw.outbuf[0] &= finalBit
-		}
+
 		c.Write(mw.outbuf[:msglen+msgheader])
 	}
 	write_pool.Put(mw)
@@ -463,7 +465,7 @@ func (c *WSconn) WriteMessage(messageType int, data []byte) error { //通用的�
 	mw := write_pool.Get().(*messageWriter)
 
 	mw.compress = false
-	mw.outbuf[0] = byte(messageType)
+	mw.outbuf[0] = byte(messageType) | finalBit
 	mw.writeBuf.Reset()
 	if c.IsCompress && len(data) > 512 {
 		mw.compress = true
@@ -476,11 +478,12 @@ func (c *WSconn) WriteMessage(messageType int, data []byte) error { //通用的�
 	if mw.compress {
 		mw.outbuf[0] |= rsv1Bit
 	}
-	for length := mw.writeBuf.Len(); length > 0; length, mw.outbuf[0] = length-defaultWriteBufferSize, continuationFrame {
+	for l := mw.writeBuf.Len(); l > 0; l, mw.outbuf[0] = mw.writeBuf.Len(), continuationFramefinalBit {
 		// Check for invalid control frames.
-		l := length
+
 		if l > defaultWriteBufferSize {
 			l = defaultWriteBufferSize //当前帧长度，不大于帧大小
+			mw.outbuf[0] -= finalBit
 		}
 
 		msglen := msgheader
@@ -506,10 +509,6 @@ func (c *WSconn) WriteMessage(messageType int, data []byte) error { //通用的�
 		default:
 			mw.outbuf[1] = byte(l)
 		}
-		if length <= defaultWriteBufferSize { //长度小于分帧大小，就结束
-			mw.outbuf[0] |= finalBit
-		}
-
 		if !c.IsServer {
 			msglen += 4
 			copy(mw.outbuf[msglen:], mw.writeBuf.Next(l))
