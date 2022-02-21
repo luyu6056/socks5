@@ -428,7 +428,7 @@ func (server *ServerConn) handleMessage() (err error) {
 			copy(buf, server.inboundBuffer.Bytes())
 			server.inChan <- buf[:server.inboundBuffer.Len()]
 			server.inboundBuffer.Reset()
-
+			m++
 		}
 		if err != nil && err != io.EOF {
 			return err
