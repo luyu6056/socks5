@@ -440,7 +440,7 @@ func (hs *f翻墙) React(data []byte, c gnet.Conn) (action gnet.Action) {
 		b := buf_pool.Get().(*tls.MsgBuffer)
 		b.Reset()
 		b.Write(data[headlen+8:])
-		antspool.Submit(func() { conn.write <- b })
+		conn.write <- b
 
 	case cmd_deletefd:
 		if ctx.client == nil {
@@ -574,15 +574,10 @@ var handsocks, _ = ants.NewPoolWithFunc(65535, func(i interface{}) {
 		conn.conn.SetReadDeadline(time.Now().Add(writeDeadline))
 		n, err = conn.conn.Read(buf[headlen:])
 		if err != nil {
-			if atomic.LoadInt32(&conn.close) == 0 {
-				if e := err.Error(); !strings.Contains(e, ": i/o timeout") {
-
-					return
-				}
-				continue
-			} else {
+			if !strings.Contains(err.Error(), ": i/o timeout") {
 				return
 			}
+			continue
 		}
 
 		msglen := headlen + n

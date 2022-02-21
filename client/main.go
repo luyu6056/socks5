@@ -185,6 +185,7 @@ func main() {
 	}()
 	//连接服务器，设置srtt为0（初始值,,默认初始窗口值,此处ip修改为server监听的ip端口
 	serverAddr = []*addr{
+
 		{"127.0.0.1:3306", 0, initWindowsSize},
 	}
 
@@ -197,7 +198,7 @@ func main() {
 
 	}
 
-	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64), gnet.WithTicker(true), gnet.WithTCPNoDelay(true))
+	gnet.Serve(hs, hs.addr, gnet.WithLoopNum(4), gnet.WithReusePort(true), gnet.WithTCPKeepAlive(time.Second*600), gnet.WithCodec(&limitcodec{}), gnet.WithOutbuf(64), gnet.WithTicker(true), gnet.WithTCPNoDelay(false))
 }
 func (hs *httpServer) OnInitComplete(srv gnet.Server) (action gnet.Action) {
 	fmt.Println("listen", hs.addr, srv.NumEventLoop)
@@ -404,6 +405,7 @@ func (server *ServerConn) handleMessage() (err error) {
 	}()
 	buf1 := make([]byte, maxPlaintext)
 	buf2 := make([]byte, maxPlaintext)
+	var buf []byte
 	m := uint8(0)
 	for {
 		server.conn.SetReadDeadline(time.Now().Add(writeDeadline))
@@ -416,16 +418,17 @@ func (server *ServerConn) handleMessage() (err error) {
 		}
 		server.tlsconn.RawWrite(server.buf[:n])
 		for err = server.tlsconn.ReadFrame(); err == nil && server.inboundBuffer.Len() > 0; err = server.tlsconn.ReadFrame() {
-			m++
-			if m%2 == 1 {
-				copy(buf1, server.inboundBuffer.Bytes())
-				server.inChan <- buf1[:server.inboundBuffer.Len()]
-			} else {
-				copy(buf2, server.inboundBuffer.Bytes())
-				server.inChan <- buf2[:server.inboundBuffer.Len()]
-			}
-			server.inboundBuffer.Reset()
 			server.rectime = time.Now().Unix()
+			if m&1 == 1 {
+				buf = buf1
+			} else {
+				buf = buf2
+			}
+
+			copy(buf, server.inboundBuffer.Bytes())
+			server.inChan <- buf[:server.inboundBuffer.Len()]
+			server.inboundBuffer.Reset()
+
 		}
 		if err != nil && err != io.EOF {
 			return err
@@ -434,6 +437,7 @@ func (server *ServerConn) handleMessage() (err error) {
 	}
 }
 func (server *ServerConn) do(msg []byte) {
+
 	var conn *Conn
 	switch msg[0] {
 	case cmd_fd:
@@ -442,10 +446,12 @@ func (server *ServerConn) do(msg []byte) {
 			flag := <-conn.wait
 			defer func() { conn.wait <- flag }()
 			if flag == connWaitclose {
+
 				return
 			}
 
 		} else {
+
 			return
 		}
 		if msg[3] == 1 {
@@ -453,7 +459,7 @@ func (server *ServerConn) do(msg []byte) {
 			conn.c.FlushWrite([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 		} else {
 			conn.c.FlushWrite([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
-			conn.c.Close()
+			go func() { conn.c.Close() }()
 		}
 
 	case cmd_deletefd:
@@ -462,14 +468,16 @@ func (server *ServerConn) do(msg []byte) {
 			flag := <-conn.wait
 			defer func() { conn.wait <- flag }()
 			if flag == connWaitclose {
+
 				return
 			}
 		} else {
+
 			return
 		}
 		conn.close = "服务器要求远程关闭"
 		conn.remote = connRemoteClose
-		conn.c.Close()
+		go func() { conn.c.Close() }()
 		return
 	case cmd_msg:
 
@@ -478,7 +486,8 @@ func (server *ServerConn) do(msg []byte) {
 		} else {
 			return
 		}
-		conn.c.FlushWrite(msg[headlen:])
+
+		conn.c.WriteNoCodec(msg[headlen:])
 		windows_size := atomic.AddInt64(&conn.windows_size, int64(headlen-len(msg)))
 		windows_update_size := int64(conn.server.addr.windows_update_size)
 
@@ -525,7 +534,7 @@ func (server *ServerConn) do(msg []byte) {
 		if !atomic.CompareAndSwapInt32(&deleteIp, 0, 1) { //第一次连接服务器会返回一次删除，无视第一次
 
 			fd_m.Range(func(k, v interface{}) bool {
-				v.(*Conn).c.Close()
+				go func() { v.(*Conn).c.Close() }()
 				fd_m.Delete(k)
 				return true
 
@@ -703,9 +712,7 @@ func (server *ServerConn) handle() {
 
 			case b := <-server.inChan:
 				server.do(b)
-				for i := 0; i < len(server.inChan); i++ {
-					server.do(<-server.inChan)
-				}
+
 			case b := <-server.outChan:
 				if b.c != nil {
 					flag := <-b.c.wait
@@ -742,10 +749,7 @@ func (server *ServerConn) handle() {
 					server.conn.Close()
 				}
 			case <-server.tick.C:
-				//尽量清空消息以接收pong避免频繁超时断连
-				for i := 0; i < len(server.inChan); i++ {
-					server.do(<-server.inChan)
-				}
+
 				pingfunc()
 
 			}
